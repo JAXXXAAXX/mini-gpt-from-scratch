@@ -2,9 +2,21 @@ import torch
 from torch.utils.data import DataLoader
 
 import config
+from src.benchmark import (
+    COMPARISON_CONFIG,
+    JSON_PATH,
+    MARKDOWN_PATH,
+    assemble_result,
+    device_metadata,
+    measure_module,
+    print_baseline_summary,
+    save_benchmark,
+    shapes_from_details,
+    verify_causal_mask,
+)
 from src.data_utils import load_tinystories, prepare_text
 from src.dataset import TextDataset
-from src.model import MiniGPT
+from src.model import MiniGPT, SelfAttentionHead
 from src.tokenizer import Tokenizer
 
 
@@ -92,6 +104,67 @@ def main():
 
     if torch.cuda.is_available() and output.device.type != "cuda":
         raise RuntimeError(f"Expected the embedding output on CUDA, got {output.device}.")
+
+    check_self_attention(train_x, output, torch.device(device))
+
+
+def check_self_attention(token_ids: torch.Tensor, embedded: torch.Tensor, device: torch.device):
+    """Run one causal head on a real batch, then record the comparison baseline."""
+    settings = COMPARISON_CONFIG
+    head = SelfAttentionHead(
+        embedding_dim=settings["embedding_dim"],
+        head_dim=settings["head_dim"],
+        block_size=settings["sequence_length"],
+        dropout=settings["dropout"],
+    ).to(device)
+
+    attention_output, details = head(embedded, return_details=True)
+    if torch.cuda.is_available() and attention_output.device.type != "cuda":
+        raise RuntimeError(f"Expected attention output on CUDA, got {attention_output.device}.")
+
+    print()
+    print("Token IDs:             ", tuple(token_ids.shape))
+    print("Embedded X:            ", tuple(embedded.shape))
+    print("Q:                     ", tuple(details["q"].shape))
+    print("K:                     ", tuple(details["k"].shape))
+    print("V:                     ", tuple(details["v"].shape))
+    print("Attention scores:      ", tuple(details["attention_scores"].shape))
+    print("Attention weights:     ", tuple(details["attention_weights"].shape))
+    print("Attention output:      ", tuple(attention_output.shape))
+
+    causal = verify_causal_mask(head, settings["embedding_dim"], device)
+    print()
+    print("Causal mask passed:", causal["passed"])
+    print("Attention weights for T = 4:")
+    for row in causal["weight_matrix"]:
+        print(" ", row)
+    if not causal["passed"]:
+        raise RuntimeError("Causal mask verification failed.")
+
+    measured = measure_module(
+        head,
+        batch_size=settings["batch_size"],
+        sequence_length=settings["sequence_length"],
+        embedding_dim=settings["embedding_dim"],
+        warmup_iterations=settings["warmup_iterations"],
+        measured_iterations=settings["measured_iterations"],
+        device=device,
+    )
+    result = assemble_result(
+        measured,
+        shapes_from_details(token_ids, embedded, details),
+        causal,
+        device_metadata(device),
+    )
+    save_benchmark(result)
+    print()
+    print_baseline_summary(result)
+    print()
+    print("Saved benchmark JSON:")
+    print(JSON_PATH.as_posix())
+    print()
+    print("Saved benchmark report:")
+    print(MARKDOWN_PATH.as_posix())
 
 
 if __name__ == "__main__":
