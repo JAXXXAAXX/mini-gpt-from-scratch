@@ -1,3 +1,9 @@
+# Data
+# Downloaded by prepare_tinystories.py. These folders are gitignored.
+TRAIN_PATH = "data/raw/tinystories/TinyStories-train.txt"
+VALID_PATH = "data/raw/tinystories/TinyStories-valid.txt"
+TOKENIZER_PATH = "data/processed/tokenizer.json"
+
 # Model configuration
 
 VOCAB_SIZE = None
