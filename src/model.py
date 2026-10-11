@@ -100,3 +100,56 @@ class SelfAttentionHead(nn.Module):
             "output": mixed,
             "batch_size": batch_size,
         }
+
+
+class MultiHeadAttention(nn.Module):
+    """Several causal heads, concatenated, then mixed by an output projection."""
+
+    def __init__(self, embedding_dim: int, num_heads: int, block_size: int, dropout: float):
+        super().__init__()
+        if num_heads < 1:
+            raise ValueError("num_heads must be at least 1.")
+        if embedding_dim % num_heads != 0:
+            raise ValueError(
+                f"embedding_dim ({embedding_dim}) must be divisible by num_heads ({num_heads})."
+            )
+        self.embedding_dim = embedding_dim
+        self.num_heads = num_heads
+        self.head_dim = embedding_dim // num_heads
+        # Each head has its own Q, K, and V, so each can learn a different pattern.
+        self.heads = nn.ModuleList(
+            [
+                SelfAttentionHead(embedding_dim, self.head_dim, block_size, dropout)
+                for _ in range(num_heads)
+            ]
+        )
+        self.output_projection = nn.Linear(embedding_dim, embedding_dim)
+        self.output_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, return_details: bool = False):
+        # Every head sees the same [B, T, C] input and returns [B, T, head_dim].
+        head_outputs = []
+        weight_matrices = []
+        for head in self.heads:
+            if return_details:
+                head_output, details = head(x, return_details=True)
+                weight_matrices.append(details["attention_weights"])
+            else:
+                head_output = head(x)
+            head_outputs.append(head_output)
+
+        # Concatenate on the channel axis: 4 x [B, T, 32] -> [B, T, 128].
+        # Different heads can learn different token relationships. Their outputs
+        # are joined so the next layer sees all of those views together.
+        concatenated = torch.cat(head_outputs, dim=-1)
+        projected = self.output_projection(concatenated)
+        output = self.output_dropout(projected)
+        if not return_details:
+            return output
+        return output, {
+            "head_outputs": head_outputs,
+            "concatenated": concatenated,
+            "projected": projected,
+            "output": output,
+            "attention_weights": weight_matrices,
+        }

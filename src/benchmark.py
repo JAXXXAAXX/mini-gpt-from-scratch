@@ -19,6 +19,7 @@ COMPARISON_CONFIG = {
     "sequence_length": 64,
     "embedding_dim": 128,
     "head_dim": 32,
+    "num_heads": 4,
     "dropout": 0.1,
     "warmup_iterations": 20,
     "measured_iterations": 100,
@@ -27,6 +28,11 @@ COMPARISON_CONFIG = {
 
 JSON_PATH = Path("experiments/single_head_benchmark.json")
 MARKDOWN_PATH = Path("experiments/single_head_benchmark.md")
+MULTI_JSON_PATH = Path("experiments/multi_head_benchmark.json")
+MULTI_MARKDOWN_PATH = Path("experiments/multi_head_benchmark.md")
+WIDE_JSON_PATH = Path("experiments/single_head_128_benchmark.json")
+WIDE_MARKDOWN_PATH = Path("experiments/single_head_128_benchmark.md")
+COMPARISON_MARKDOWN_PATH = Path("experiments/attention_comparison.md")
 
 
 def _synchronize(device: torch.device) -> None:
@@ -93,17 +99,9 @@ def measure_module(
     }
 
 
-def verify_causal_mask(module: nn.Module, embedding_dim: int, device: torch.device) -> dict:
-    """Check a length-4 sequence. Future attention probabilities must be ~0."""
-    was_training = module.training
-    module.eval()
-    sequence_length = 4
-    probe = torch.randn(1, sequence_length, embedding_dim, device=device)
-    with torch.no_grad():
-        _output, details = module(probe, return_details=True)
-    weights = details["attention_weights"][0].detach().float().cpu()
-    module.train(was_training)
-
+def _check_weight_matrix(weights: torch.Tensor) -> dict:
+    """Check one [T, T] attention matrix. Future positions must be ~0."""
+    sequence_length = weights.shape[0]
     future = torch.triu(torch.ones(sequence_length, sequence_length, dtype=torch.bool), diagonal=1)
     future_near_zero = bool(torch.all(weights[future] < 1e-5))
     position_checks = []
@@ -119,13 +117,43 @@ def verify_causal_mask(module: nn.Module, embedding_dim: int, device: torch.devi
                 "passed": abs(allowed_mass - 1.0) < 1e-4 and blocked_mass < 1e-5,
             }
         )
-
     return {
         "passed": future_near_zero and all(item["passed"] for item in position_checks),
         "sequence_length": sequence_length,
         "future_probabilities_near_zero": future_near_zero,
         "position_checks": position_checks,
         "weight_matrix": [[round(float(value), 4) for value in row] for row in weights],
+    }
+
+
+def verify_causal_mask(module: nn.Module, embedding_dim: int, device: torch.device) -> dict:
+    """Check a length-4 sequence. Future attention probabilities must be ~0.
+
+    A multi-head module returns one weight matrix per head. Every head is checked.
+    The example matrix kept for the report is the first head only.
+    """
+    was_training = module.training
+    module.eval()
+    sequence_length = 4
+    probe = torch.randn(1, sequence_length, embedding_dim, device=device)
+    with torch.no_grad():
+        _output, details = module(probe, return_details=True)
+    raw_weights = details["attention_weights"]
+    groups = raw_weights if isinstance(raw_weights, list) else [raw_weights]
+    reports = [_check_weight_matrix(group[0].detach().float().cpu()) for group in groups]
+    module.train(was_training)
+
+    first = reports[0]
+    return {
+        "passed": all(item["passed"] for item in reports),
+        "head_count": len(reports),
+        "heads_passed": [item["passed"] for item in reports],
+        "sequence_length": sequence_length,
+        "future_probabilities_near_zero": all(
+            item["future_probabilities_near_zero"] for item in reports
+        ),
+        "position_checks": first["position_checks"],
+        "weight_matrix": first["weight_matrix"],
     }
 
 
@@ -188,15 +216,26 @@ def shapes_from_details(token_ids: torch.Tensor, embedded: torch.Tensor, details
     }
 
 
-def assemble_result(measured: dict, shapes: dict, causal_mask: dict, meta: dict) -> dict:
+def assemble_result(
+    measured: dict,
+    shapes: dict,
+    causal_mask: dict,
+    meta: dict,
+    model: str = "single_head_attention",
+    head_dim: int | None = None,
+    num_heads: int = 1,
+    report_title: str = "Single-Head Self-Attention Benchmark Report",
+) -> dict:
     """One dictionary feeds both the JSON file and the Markdown report."""
     config = COMPARISON_CONFIG
     return {
-        "model": "single_head_attention",
+        "model": model,
+        "report_title": report_title,
         "batch_size": config["batch_size"],
         "sequence_length": config["sequence_length"],
         "embedding_dim": config["embedding_dim"],
-        "head_dim": config["head_dim"],
+        "head_dim": config["head_dim"] if head_dim is None else head_dim,
+        "num_heads": num_heads,
         "dropout": config["dropout"],
         "warmup_iterations": config["warmup_iterations"],
         "measured_iterations": config["measured_iterations"],
@@ -225,6 +264,83 @@ def _memory_text(result: dict) -> str:
     )
 
 
+def _model_config_lines(result: dict) -> str:
+    shapes = result["shapes"]
+    lines = [
+        f"- Model name: `{result['model']}`",
+        f"- Heads: {result.get('num_heads', 1)}",
+        f"- Head dimension: {result['head_dim']}",
+        f"- Trainable parameters: {result['parameter_count']:,}",
+    ]
+    if "head_outputs" in shapes:
+        lines.append(f"- Input X: `{shapes['input']}`")
+        for index, shape in enumerate(shapes["head_outputs"], start=1):
+            lines.append(f"- Head {index} output: `{shape}`")
+        lines.append(f"- Concatenated output: `{shapes['concatenated']}`")
+        lines.append(f"- Projected output: `{shapes['output']}`")
+        return "\n".join(lines)
+    lines.extend(
+        [
+            f"- Input token IDs: `{shapes['token_ids']}`",
+            f"- Embedded input X: `{shapes['embedded_input']}`",
+            f"- Q: `{shapes['q']}`",
+            f"- K: `{shapes['k']}`",
+            f"- V: `{shapes['v']}`",
+            f"- Attention scores: `{shapes['attention_scores']}`",
+            f"- Attention weights: `{shapes['attention_weights']}`",
+            f"- Output: `{shapes['output']}`",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _shape_table(shapes: dict) -> str:
+    if "head_outputs" in shapes:
+        rows = [f"| Input X | `[B, T, C]` | `{shapes['input']}` |"]
+        for index, shape in enumerate(shapes["head_outputs"], start=1):
+            rows.append(f"| Head {index} output | `[B, T, H]` | `{shape}` |")
+        rows.append(f"| Concatenated output | `[B, T, C]` | `{shapes['concatenated']}` |")
+        rows.append(f"| Projected output | `[B, T, C]` | `{shapes['output']}` |")
+        body = "\n".join(rows)
+    else:
+        body = "\n".join(
+            [
+                f"| Input token IDs | `[B, T]` | `{shapes['token_ids']}` |",
+                f"| Embedded input X | `[B, T, C]` | `{shapes['embedded_input']}` |",
+                f"| Q | `[B, T, H]` | `{shapes['q']}` |",
+                f"| K | `[B, T, H]` | `{shapes['k']}` |",
+                f"| V | `[B, T, H]` | `{shapes['v']}` |",
+                f"| Attention Scores | `[B, T, T]` | `{shapes['attention_scores']}` |",
+                f"| Attention Weights | `[B, T, T]` | `{shapes['attention_weights']}` |",
+                f"| Attention Output | `[B, T, H]` | `{shapes['output']}` |",
+            ]
+        )
+    return f"| Tensor | Shape | Measured |\n|---|---|---|\n{body}"
+
+
+def _interpretation(result: dict) -> str:
+    count = result.get("num_heads", 1)
+    noun = "head" if count == 1 else "heads"
+    width = count * result["head_dim"]
+    if result["model"] == "multi_head_attention":
+        opening = (
+            f"Multi-head attention uses {count} {noun} of dimension {result['head_dim']} "
+            f"(total attention width {width}) and has {result['parameter_count']:,} trainable parameters."
+        )
+    else:
+        opening = (
+            f"This causal attention module uses {count} {noun} of dimension "
+            f"{result['head_dim']} and has {result['parameter_count']:,} trainable parameters."
+        )
+    return (
+        f"{opening} On this run the forward + backward step processed about "
+        f"{_fmt_number(result['tokens_per_second'], 0)} tokens/sec, using a batch of "
+        f"{result['batch_size']} sequences of length {result['sequence_length']}. {_memory_text(result)}\n\n"
+        "These numbers describe compute, parameters, and memory for this module. "
+        "They are not evidence about which architecture learns TinyStories better."
+    )
+
+
 def generate_benchmark_report(result: dict) -> str:
     """Render a Markdown report from a benchmark result dictionary."""
     shapes = result["shapes"]
@@ -249,8 +365,31 @@ def generate_benchmark_report(result: dict) -> str:
         "unavailable" if result["peak_gpu_memory_mb"] is None else f"{result['peak_gpu_memory_mb']:.2f} MB"
     )
     single_memory = "TBD" if result["peak_gpu_memory_mb"] is None else f"{result['peak_gpu_memory_mb']:.2f} MB"
+    title = result.get("report_title", "Single-Head Self-Attention Benchmark Report")
+    head_count = mask.get("head_count", 1)
+    mask_scope = (
+        f"All {head_count} heads passed."
+        if head_count > 1 and mask["passed"]
+        else f"Heads checked: {head_count}. Status: {'passed' if mask['passed'] else 'failed'}."
+    )
+    future_table = ""
+    if result["model"] == "single_head_attention":
+        future_table = f"""
+## Future Comparison with Multi-Head Attention
 
-    return f"""# Single-Head Self-Attention Benchmark Report
+Computational performance and learning performance stay in separate columns. They are not combined into one score.
+
+| Metric | Single Head | Multi Head |
+|---|---:|---:|
+| Parameters | {result["parameter_count"]:,} | TBD |
+| Forward Latency | {result["forward_latency_ms"]:.3f} ms | TBD |
+| Forward + Backward Latency | {result["forward_backward_latency_ms"]:.3f} ms | TBD |
+| Throughput | {_fmt_number(result["tokens_per_second"], 0)} tokens/sec | TBD |
+| Peak GPU Memory | {single_memory} | TBD |
+| Validation Loss | TBD | TBD |
+"""
+
+    return f"""# {title}
 
 ## Experiment Configuration
 
@@ -270,16 +409,7 @@ def generate_benchmark_report(result: dict) -> str:
 
 ## Model Configuration
 
-- Model name: `{result["model"]}`
-- Trainable parameters: {result["parameter_count"]:,}
-- Input token IDs: `{shapes["token_ids"]}`
-- Embedded input X: `{shapes["embedded_input"]}`
-- Q: `{shapes["q"]}`
-- K: `{shapes["k"]}`
-- V: `{shapes["v"]}`
-- Attention scores: `{shapes["attention_scores"]}`
-- Attention weights: `{shapes["attention_weights"]}`
-- Output: `{shapes["output"]}`
+{_model_config_lines(result)}
 
 ## Computational Performance
 
@@ -293,13 +423,13 @@ def generate_benchmark_report(result: dict) -> str:
 
 ## Causal Mask Verification
 
-Status: {"passed" if mask["passed"] else "failed"}.
+Status: {"passed" if mask["passed"] else "failed"}. {mask_scope}
 
 Future attention probabilities are {"approximately zero" if mask["future_probabilities_near_zero"] else "not approximately zero"}.
 
 {position_lines}
 
-Example attention weights for one sequence of length {mask["sequence_length"]}. Rows are queries and columns are keys. Entries above the diagonal are the masked future positions.
+Example attention weights for one sequence of length {mask["sequence_length"]}. When several heads are checked, this matrix is head 1 only. Rows are queries and columns are keys. Entries above the diagonal are the masked future positions.
 
 | | 0 | 1 | 2 | 3 |
 |---|---:|---:|---:|---:|
@@ -307,45 +437,21 @@ Example attention weights for one sequence of length {mask["sequence_length"]}. 
 
 ## Shape Verification
 
-| Tensor | Shape | Measured |
-|---|---|---|
-| Input token IDs | `[B, T]` | `{shapes["token_ids"]}` |
-| Embedded input X | `[B, T, C]` | `{shapes["embedded_input"]}` |
-| Q | `[B, T, H]` | `{shapes["q"]}` |
-| K | `[B, T, H]` | `{shapes["k"]}` |
-| V | `[B, T, H]` | `{shapes["v"]}` |
-| Attention Scores | `[B, T, T]` | `{shapes["attention_scores"]}` |
-| Attention Weights | `[B, T, T]` | `{shapes["attention_weights"]}` |
-| Attention Output | `[B, T, H]` | `{shapes["output"]}` |
+{_shape_table(shapes)}
 
 ## Interpretation
 
-One causal self-attention head has {result["parameter_count"]:,} trainable parameters. On this run the forward + backward step processed about {_fmt_number(result["tokens_per_second"], 0)} tokens/sec, using a batch of {result["batch_size"]} sequences of length {result["sequence_length"]}. {_memory_text(result)}
-
-This is a computational baseline for one attention module. It is not evidence that single-head attention learns better or worse than multi-head attention.
+{_interpretation(result)}
 
 ## Limitations
 
-This benchmark measures only the single-head attention module. It does not measure full language-model quality.
+This benchmark measures only this attention module. It does not measure full language-model quality.
 
 - There is no complete Transformer block yet.
 - There is no language-model head yet.
 - Validation loss comparison is not yet available.
 - Runtime measurements can vary with GPU state and other system load.
-
-## Future Comparison with Multi-Head Attention
-
-Computational performance and learning performance stay in separate columns. They are not combined into one score.
-
-| Metric | Single Head | Multi Head |
-|---|---:|---:|
-| Parameters | {result["parameter_count"]:,} | TBD |
-| Forward Latency | {result["forward_latency_ms"]:.3f} ms | TBD |
-| Forward + Backward Latency | {result["forward_backward_latency_ms"]:.3f} ms | TBD |
-| Throughput | {_fmt_number(result["tokens_per_second"], 0)} tokens/sec | TBD |
-| Peak GPU Memory | {single_memory} | TBD |
-| Validation Loss | TBD | TBD |
-"""
+{future_table}"""
 
 
 def save_benchmark(result: dict, json_path: Path = JSON_PATH, markdown_path: Path = MARKDOWN_PATH) -> None:
@@ -355,15 +461,130 @@ def save_benchmark(result: dict, json_path: Path = JSON_PATH, markdown_path: Pat
     markdown_path.write_text(generate_benchmark_report(result), encoding="utf-8")
 
 
-def print_baseline_summary(result: dict) -> None:
+def print_baseline_summary(result: dict, title: str = "=== Single-Head Attention Baseline ===") -> None:
     memory = (
         "unavailable"
         if result["peak_gpu_memory_mb"] is None
         else f"{result['peak_gpu_memory_mb']:.2f} MB"
     )
-    print("=== Single-Head Attention Baseline ===")
+    print(title)
     print(f"Parameters:               {result['parameter_count']:,}")
     print(f"Forward latency:          {result['forward_latency_ms']:.3f} ms")
     print(f"Forward + backward:       {result['forward_backward_latency_ms']:.3f} ms")
     print(f"Throughput:               {result['tokens_per_second']:,.0f} tokens/sec")
     print(f"Peak GPU memory:          {memory}")
+
+
+def _memory_cell(result: dict) -> str:
+    if result["peak_gpu_memory_mb"] is None:
+        return "unavailable"
+    return f"{result['peak_gpu_memory_mb']:.2f} MB"
+
+
+def _delta(left: float, right: float, digits: int, suffix: str = "") -> str:
+    value = left - right
+    if digits == 0:
+        return f"{value:+,.0f}{suffix}"
+    return f"{value:+,.{digits}f}{suffix}"
+
+
+def generate_attention_comparison(single: dict, multi: dict, single_wide: dict) -> str:
+    """Build the comparison report from saved benchmark dictionaries."""
+    gpu_name = multi["gpu_name"] or "none"
+    cuda_version = multi["cuda_version"] or "none"
+    memory_delta = (
+        "unavailable"
+        if multi["peak_gpu_memory_mb"] is None or single["peak_gpu_memory_mb"] is None
+        else _delta(multi["peak_gpu_memory_mb"], single["peak_gpu_memory_mb"], 2, " MB")
+    )
+    wide_memory = _memory_cell(single_wide)
+    multi_memory = _memory_cell(multi)
+    return f"""# Single-Head vs Multi-Head Attention
+
+## Experimental Setup
+
+- Device: `{multi["device"]}`
+- GPU name: {gpu_name}
+- PyTorch version: {multi["pytorch_version"]}
+- CUDA version: {cuda_version}
+- Batch size: {multi["batch_size"]}
+- Sequence length: {multi["sequence_length"]}
+- Embedding dimension: {multi["embedding_dim"]}
+- Dropout: {multi["dropout"]}
+- Warm-up iterations: {multi["warmup_iterations"]}
+- Measured iterations: {multi["measured_iterations"]}
+- Input shape for every run: `[{multi["batch_size"]}, {multi["sequence_length"]}, {multi["embedding_dim"]}]`
+- Throughput is `(batch_size × sequence_length) / forward_backward_seconds`.
+- Difference in the table below is Multi Head minus Single Head.
+
+The single-head baseline uses `head_dim = {single["head_dim"]}`. Multi-head attention uses `{multi["num_heads"]} × {multi["head_dim"]} = {multi["num_heads"] * multi["head_dim"]}` total attention width. These two runs do not have equal representational capacity. A difference in speed or parameter count here is not evidence that one architecture learns better.
+
+## Computational Performance
+
+| Metric | Single Head | Multi Head | Difference |
+|---|---:|---:|---:|
+| Parameters | {single["parameter_count"]:,} | {multi["parameter_count"]:,} | {_delta(multi["parameter_count"], single["parameter_count"], 0)} |
+| Forward Latency | {single["forward_latency_ms"]:.3f} ms | {multi["forward_latency_ms"]:.3f} ms | {_delta(multi["forward_latency_ms"], single["forward_latency_ms"], 3, " ms")} |
+| Forward + Backward | {single["forward_backward_latency_ms"]:.3f} ms | {multi["forward_backward_latency_ms"]:.3f} ms | {_delta(multi["forward_backward_latency_ms"], single["forward_backward_latency_ms"], 3, " ms")} |
+| Throughput | {_fmt_number(single["tokens_per_second"], 0)} tok/s | {_fmt_number(multi["tokens_per_second"], 0)} tok/s | {_delta(multi["tokens_per_second"], single["tokens_per_second"], 0, " tok/s")} |
+| Peak GPU Memory | {_memory_cell(single)} | {_memory_cell(multi)} | {memory_delta} |
+
+## Parameter Comparison
+
+Single Head 32 has {single["parameter_count"]:,} trainable parameters. Multi Head has {multi["parameter_count"]:,}. The extra parameters come from three more heads plus the output projection. Parameter count is not a quality score.
+
+## Throughput and Latency
+
+On this run, one forward pass took {single["forward_latency_ms"]:.3f} ms for Single Head 32 and {multi["forward_latency_ms"]:.3f} ms for Multi Head. Forward + backward took {single["forward_backward_latency_ms"]:.3f} ms and {multi["forward_backward_latency_ms"]:.3f} ms. Throughput was {_fmt_number(single["tokens_per_second"], 0)} tok/s and {_fmt_number(multi["tokens_per_second"], 0)} tok/s.
+
+## GPU Memory
+
+Peak allocated memory during the timed forward + backward steps was {_memory_cell(single)} for Single Head 32 and {multi_memory} for Multi Head.
+
+## Architectural Difference
+
+Single-head attention learns one attention pattern space. Multi-head attention runs several heads on the same input, concatenates their outputs, and mixes them with a linear projection.
+
+After training, different heads may specialize. Examples of possible specializations, not patterns observed in this untrained benchmark:
+
+- Head 1 may focus on local token relationships.
+- Head 2 may focus on subject-verb relationships.
+- Head 3 may focus on long-range dependencies.
+- Head 4 may focus on other contextual patterns.
+
+This benchmark does not show that any head has learned those roles.
+
+## Interpretation
+
+The first table compares a 32-wide head with four 32-wide heads. Multi-head attention has more parameters and a wider combined attention representation, so a latency or memory gap is expected and does not decide which design is better.
+
+## Capacity-Controlled Comparison
+
+Single Head 128 is one head with `head_dim = 128`. Multi Head is `{multi["num_heads"]}` heads with `head_dim = {multi["head_dim"]}`. Both have total attention width 128, and both read the same `[B, T, C]` input. This is the more appropriate comparison for the architecture itself. It is still only a compute and capacity comparison. Multi-head attention also has an output projection, so the parameter counts are not forced to match. In this code each head is a separate module and runs one after another, so the latency includes that sequential loop. A later fused implementation could spend its time differently.
+
+| Metric | Single Head 128 | Multi Head 4×32 |
+|---|---:|---:|
+| Total Attention Width | 128 | 128 |
+| Parameters | {single_wide["parameter_count"]:,} | {multi["parameter_count"]:,} |
+| Forward Latency | {single_wide["forward_latency_ms"]:.3f} ms | {multi["forward_latency_ms"]:.3f} ms |
+| Forward + Backward | {single_wide["forward_backward_latency_ms"]:.3f} ms | {multi["forward_backward_latency_ms"]:.3f} ms |
+| Throughput | {_fmt_number(single_wide["tokens_per_second"], 0)} tok/s | {_fmt_number(multi["tokens_per_second"], 0)} tok/s |
+| Peak GPU Memory | {wide_memory} | {multi_memory} |
+
+## Limitations
+
+Computational performance is not model quality. This comparison does not include training loss or validation loss.
+
+- There is no complete Transformer block yet.
+- There is no language-model head yet.
+- There is no loss or training loop yet.
+- Runtime measurements can vary with GPU state and other system load.
+
+## Next Experiment
+
+Add a Transformer block: residual connections, layer normalization, and a feed-forward network. After that, add a language-model head, loss, and a fixed-step training loop so single-head and multi-head models can be compared on validation loss under the same data, batch size, block size, embedding size, optimizer, and learning rate.
+"""
+
+
+def load_benchmark(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
