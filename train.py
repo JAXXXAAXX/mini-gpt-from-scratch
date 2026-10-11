@@ -1,8 +1,10 @@
+import torch
 from torch.utils.data import DataLoader
 
 import config
 from src.data_utils import load_tinystories, prepare_text
 from src.dataset import TextDataset
+from src.model import MiniGPT
 from src.tokenizer import Tokenizer
 
 
@@ -62,6 +64,34 @@ def main():
     print()
     print("Target:")
     print(tokenizer.decode(sample_y.tolist()))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    config.VOCAB_SIZE = tokenizer.vocab_size
+    model = MiniGPT(
+        vocab_size=tokenizer.vocab_size,
+        block_size=config.BLOCK_SIZE,
+        embedding_dim=config.EMBEDDING_DIM,
+    ).to(device)
+    train_x = train_x.to(device)
+
+    positions = torch.arange(train_x.shape[1], device=train_x.device)
+    token_emb = model.token_embedding(train_x)
+    position_emb = model.position_embedding(positions)
+    output = model(train_x)
+
+    print()
+    print("Device:", device)
+    print("CUDA available:", torch.cuda.is_available())
+    print("GPU name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
+    print("Token IDs shape:", tuple(train_x.shape))
+    print("Token embedding shape:", tuple(token_emb.shape))
+    print("Position embedding shape:", tuple(position_emb.shape))
+    print("Final embedding output shape:", tuple(output.shape))
+    print("Output device:", output.device)
+    print("parameters:", sum(p.numel() for p in model.parameters()))
+
+    if torch.cuda.is_available() and output.device.type != "cuda":
+        raise RuntimeError(f"Expected the embedding output on CUDA, got {output.device}.")
 
 
 if __name__ == "__main__":
