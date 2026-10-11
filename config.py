@@ -54,3 +54,11 @@ FINAL_EVAL_JSON = "experiments/final_evaluation.json"
 FINAL_EVAL_REPORT = "experiments/final_report.md"
 # None means evaluate every validation batch.
 EVAL_MAX_BATCHES = None
+
+# Story generation evaluation harness (v1 baseline)
+STORY_EVAL_JSON = "experiments/story_eval_v1.json"
+STORY_EVAL_REPORT = "experiments/story_eval_v1.md"
+STORY_EVAL_MAX_NEW_TOKENS = 300
+STORY_EVAL_TEMPERATURE = 0.8
+STORY_EVAL_TOP_K = 20
+STORY_EVAL_SEED = 42
