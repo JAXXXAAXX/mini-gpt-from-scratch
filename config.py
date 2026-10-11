@@ -48,3 +48,9 @@ GENERATION_TOP_K = 20
 GENERATION_SEED = 42
 GENERATION_SAMPLES_PATH = "experiments/generation_samples.json"
 GENERATION_REPORT_PATH = "experiments/generation_report.md"
+
+# Evaluation
+FINAL_EVAL_JSON = "experiments/final_evaluation.json"
+FINAL_EVAL_REPORT = "experiments/final_report.md"
+# None means evaluate every validation batch.
+EVAL_MAX_BATCHES = None
