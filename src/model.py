@@ -106,10 +106,12 @@ class MiniGPT(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: int | None = None,
+        eos_token_id: int | None = None,
     ) -> torch.Tensor:
         """Sample new tokens one at a time and append them to the context.
 
         Softmax is used only here. Training keeps raw logits for CrossEntropyLoss.
+        When eos_token_id is set, sampling stops early after that token is produced.
         """
         if token_ids.ndim != 2:
             raise ValueError(f"token_ids must have shape [B, T], got {tuple(token_ids.shape)}.")
@@ -119,6 +121,8 @@ class MiniGPT(nn.Module):
             raise ValueError("temperature must be greater than 0.")
         if top_k is not None and top_k < 1:
             raise ValueError("top_k must be None or greater than 0.")
+        if eos_token_id is not None and not (0 <= eos_token_id < self.vocab_size):
+            raise ValueError("eos_token_id must be None or a valid vocabulary index.")
 
         was_training = self.training
         self.eval()
@@ -141,6 +145,8 @@ class MiniGPT(nn.Module):
             if not ((next_token >= 0) & (next_token < self.vocab_size)).all():
                 raise RuntimeError("Sampled a token id outside the vocabulary.")
             generated = torch.cat([generated, next_token], dim=1)
+            if eos_token_id is not None and bool((next_token == eos_token_id).all()):
+                break
 
         if was_training:
             self.train()

@@ -119,6 +119,7 @@ def save_checkpoint(path: Path, model, optimizer, step: int, train_loss: float, 
             "train_loss": train_loss,
             "validation_loss": validation_loss,
             "model_config": {
+                "tokenizer_type": config.TOKENIZER_TYPE,
                 "vocab_size": model.vocab_size,
                 "block_size": model.block_size,
                 "embedding_dim": model.embedding_dim,
@@ -146,6 +147,9 @@ def train_steps(
     device: torch.device,
     start_step: int = 0,
     best_validation_loss: float = float("inf"),
+    best_checkpoint_path: str | None = None,
+    latest_checkpoint_path: str | None = None,
+    characters_per_token: float | None = None,
 ) -> dict:
     """Train for config.MAX_STEPS and record loss at each eval interval."""
     model.train()
@@ -154,7 +158,8 @@ def train_steps(
     train_seconds = 0.0
     train_tokens = 0
     best_loss = best_validation_loss
-    checkpoint_dir = Path(config.CHECKPOINT_DIR)
+    best_path = Path(best_checkpoint_path or config.BEST_CHECKPOINT)
+    latest_path = Path(latest_checkpoint_path or config.LATEST_CHECKPOINT)
     started = time.perf_counter()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -175,7 +180,7 @@ def train_steps(
         print(f"Validation Loss: {validation_loss:.4f}")
         print()
         save_checkpoint(
-            checkpoint_dir / "latest.pt",
+            latest_path,
             model,
             optimizer,
             step,
@@ -185,7 +190,7 @@ def train_steps(
         if validation_loss < best_loss:
             best_loss = validation_loss
             save_checkpoint(
-                checkpoint_dir / "best.pt",
+                best_path,
                 model,
                 optimizer,
                 step,
@@ -226,15 +231,22 @@ def train_steps(
     if device.type == "cuda":
         peak_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
     throughput = train_tokens / train_seconds if train_seconds > 0 else 0.0
+    characters_per_second = None
+    if characters_per_token is not None:
+        characters_per_second = throughput * characters_per_token
     best_entry = min(history, key=lambda item: item["validation_loss"])
     return {
         "history": history,
         "tokens_per_second": throughput,
+        "characters_per_second": characters_per_second,
+        "characters_per_token": characters_per_token,
         "peak_gpu_memory_mb": peak_mb,
         "best_step": best_entry["step"],
         "best_validation_loss": best_entry["validation_loss"],
         "best_validation_perplexity": perplexity(best_entry["validation_loss"]),
         "elapsed_seconds": time.perf_counter() - started,
+        "best_checkpoint_path": best_path.as_posix(),
+        "latest_checkpoint_path": latest_path.as_posix(),
     }
 
 
@@ -284,8 +296,9 @@ def generate_training_report(result: dict) -> str:
 
 - Device: `{result["device"]}`
 - GPU name: {gpu_name}
+- Tokenizer type: {result.get("tokenizer_type", "char")}
 - Vocabulary size: {result["vocab_size"]}
-- Block size: {result["block_size"]}
+- Block size: {result["block_size"]} tokenizer units
 - Embedding dimension: {result["embedding_dim"]}
 - Heads: {result["num_heads"]}
 - Layers: {result["num_layers"]}
@@ -311,7 +324,7 @@ def generate_training_report(result: dict) -> str:
 
 ## Training Setup
 
-AdamW updates the model on next-token cross-entropy. Each logged train loss is the average of the training steps since the previous log. Validation loss is the average over {result["eval_batches"]} validation batches, with gradients disabled. Checkpoints are `checkpoints/latest.pt` and `checkpoints/best.pt`.
+AdamW updates the model on next-token cross-entropy. Each logged train loss is the average of the training steps since the previous log. Validation loss is the average over {result["eval_batches"]} validation batches, with gradients disabled. Checkpoints are `{result.get("latest_checkpoint_path", config.LATEST_CHECKPOINT)}` and `{result.get("best_checkpoint_path", config.BEST_CHECKPOINT)}`.
 
 ## Loss Progress
 
@@ -332,10 +345,11 @@ Perplexity is `exp(validation loss)`. A lower value means the model assigns more
 ## Computational Performance
 
 - Training throughput: {result["tokens_per_second"]:,.0f} tokens/sec
+- Characters/sec: {"N/A" if result.get("characters_per_second") is None else f"{result['characters_per_second']:,.0f}"}
 - Peak GPU memory: {memory}
 - Elapsed time, including validation: {result["elapsed_seconds"]:.1f} s
 
-Throughput counts only optimizer steps. Validation time is excluded.
+Throughput counts only optimizer steps. Validation time is excluded. Tokens/sec is not directly comparable across character and BPE tokenizers; prefer characters/sec for text-throughput comparisons.
 
 ## Observations
 
@@ -343,14 +357,14 @@ Throughput counts only optimizer steps. Validation time is excluded.
 
 ## Limitations
 
-- The run uses a 5,000-story TinyStories slice and a character vocabulary.
-- There is no text generation yet.
-- Perplexity is only a summary of next-character loss.
+- The run uses a 5,000-story TinyStories slice.
+- Perplexity summarizes next-token loss for the active tokenizer units.
 - A short run can still leave the validation loss far from a useful language model.
+- Block size {result["block_size"]} means different amounts of text for character vs BPE tokens.
 
 ## Next Step
 
-Generate text from `checkpoints/best.pt` with the saved tokenizer, without fitting a new vocabulary.
+Generate text from `{result.get("best_checkpoint_path", config.BEST_CHECKPOINT)}` with the matching saved tokenizer. Do not load character-model weights into a BPE vocabulary.
 """
 
 

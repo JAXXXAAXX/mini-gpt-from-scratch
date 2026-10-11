@@ -10,7 +10,7 @@ import torch
 
 import config
 from src.model import MiniGPT
-from src.tokenizer import Tokenizer
+from src.tokenizer_utils import eos_token_id, load_tokenizer, resolve_tokenizer_type
 
 
 def safe_print(text: str) -> None:
@@ -26,6 +26,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=config.GENERATION_TOP_K)
     parser.add_argument("--checkpoint", default=config.BEST_CHECKPOINT)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--no-eos-stop",
+        action="store_true",
+        help="Do not stop early when <eos> is sampled (BPE only).",
+    )
     parser.add_argument(
         "--run-experiments",
         action="store_true",
@@ -58,10 +63,10 @@ def load_model(checkpoint_path: str, device: torch.device) -> tuple[MiniGPT, dic
     return model, checkpoint
 
 
-def encode_prompt(tokenizer: Tokenizer, prompt: str, device: torch.device) -> torch.Tensor:
-    # Reuse the training vocabulary. Do not fit a new tokenizer for generation.
+def encode_prompt(tokenizer, prompt: str, device: torch.device) -> torch.Tensor:
+    # Reuse the saved vocabulary. Do not fit a new tokenizer for generation.
     try:
-        token_ids = tokenizer.encode(prompt)
+        token_ids = tokenizer.encode(prompt, add_bos=False, add_eos=False)
     except ValueError as exc:
         raise ValueError(
             "The prompt contains characters that are not in the training vocabulary.\n"
@@ -74,16 +79,18 @@ def encode_prompt(tokenizer: Tokenizer, prompt: str, device: torch.device) -> to
 
 def generate_once(
     model: MiniGPT,
-    tokenizer: Tokenizer,
+    tokenizer,
     prompt: str,
     max_new_tokens: int,
     temperature: float,
     top_k: int | None,
     seed: int | None,
     device: torch.device,
+    stop_on_eos: bool = True,
 ) -> dict:
     set_seed(seed, device)
     prompt_ids = encode_prompt(tokenizer, prompt, device)
+    stop_id = eos_token_id(tokenizer) if stop_on_eos else None
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
@@ -93,14 +100,16 @@ def generate_once(
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_k=top_k,
+        eos_token_id=stop_id,
     )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - started
 
-    if output_ids.shape[1] != prompt_ids.shape[1] + max_new_tokens:
+    tokens_generated = int(output_ids.shape[1] - prompt_ids.shape[1])
+    if tokens_generated < 1 or tokens_generated > max_new_tokens:
         raise RuntimeError(
-            f"Expected {prompt_ids.shape[1] + max_new_tokens} tokens, got {output_ids.shape[1]}."
+            f"Expected between 1 and {max_new_tokens} new tokens, got {tokens_generated}."
         )
     if model.training:
         raise RuntimeError("The model should remain in evaluation mode after generation.")
@@ -108,10 +117,16 @@ def generate_once(
         raise RuntimeError("Generation stored gradients. Use inference mode with no backward pass.")
 
     generated_ids = output_ids[0].tolist()
-    text = tokenizer.decode(generated_ids)
+    text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     peak_mb = None
     if device.type == "cuda":
         peak_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
+
+    continuation_ids = generated_ids[prompt_ids.shape[1] :]
+    chars_generated = len(text) - len(prompt) if text.startswith(prompt) else len(text)
+    stopped_on_eos = bool(
+        stop_id is not None and continuation_ids and continuation_ids[-1] == stop_id
+    )
     return {
         "prompt": prompt,
         "temperature": temperature,
@@ -120,9 +135,13 @@ def generate_once(
         "seed": seed,
         "generated_text": text,
         "generation_time_seconds": elapsed,
-        "tokens_generated": max_new_tokens,
-        "tokens_per_second": max_new_tokens / elapsed if elapsed > 0 else 0.0,
+        "tokens_generated": tokens_generated,
+        "tokens_per_second": tokens_generated / elapsed if elapsed > 0 else 0.0,
+        "characters_generated": max(chars_generated, 0),
+        "characters_per_second": max(chars_generated, 0) / elapsed if elapsed > 0 else 0.0,
         "peak_gpu_memory_mb": peak_mb,
+        "stopped_on_eos": stopped_on_eos,
+        "eos_supported": stop_id is not None,
     }
 
 
@@ -157,6 +176,7 @@ def generate_report(samples: list[dict], checkpoint: dict, model: MiniGPT) -> st
         else "unavailable because CUDA was not used"
     )
     avg_tps = sum(item["tokens_per_second"] for item in samples) / len(samples)
+    avg_cps = sum(item.get("characters_per_second", 0.0) for item in samples) / len(samples)
     return f"""# MiniGPT Generation Report
 
 ## Model
@@ -168,6 +188,7 @@ def generate_report(samples: list[dict], checkpoint: dict, model: MiniGPT) -> st
 ## Checkpoint
 
 - Path: `{config.BEST_CHECKPOINT}`
+- Tokenizer type: {checkpoint.get("model_config", {}).get("tokenizer_type", config.TOKENIZER_TYPE)}
 - Training step: {checkpoint["step"]}
 - Train loss: {checkpoint["train_loss"]:.4f}
 - Validation loss: {checkpoint["validation_loss"]:.4f}
@@ -192,22 +213,22 @@ def generate_report(samples: list[dict], checkpoint: dict, model: MiniGPT) -> st
 ## Generation Performance
 
 - Average tokens/sec across experiments: {avg_tps:.1f}
+- Average characters/sec across experiments: {avg_cps:.1f}
 - Peak GPU memory during generation: {peak_text}
 
 ## Observations
 
-Lower temperature and a smaller top-k keep the next character closer to the model's highest scores. Higher temperature and a larger top-k, or no top-k, let lower-scoring characters appear more often. These samples show sampling behavior after 1,000 training steps. They are not a finished story writer.
+Lower temperature and a smaller top-k keep the next token closer to the model's highest scores. Higher temperature and a larger top-k, or no top-k, let lower-scoring tokens appear more often.
 
 ## Limitations
 
-- The model uses a character vocabulary and a short context of {model.block_size} tokens.
+- Context length is {model.block_size} tokenizer units.
 - There is no top-p sampling, beam search, repetition penalty, or KV cache.
-- Generation quality is limited by the short TinyStories training run.
-- Unknown prompt characters are rejected instead of being mapped to a fallback token.
+- Tokens/sec is not directly comparable across character and BPE models; prefer characters/sec.
 """
 
 
-def run_experiments(model: MiniGPT, tokenizer: Tokenizer, checkpoint: dict, device: torch.device) -> None:
+def run_experiments(model: MiniGPT, tokenizer, checkpoint: dict, device: torch.device) -> None:
     experiments = [
         {"temperature": 0.5, "top_k": 10},
         {"temperature": 0.8, "top_k": 20},
@@ -252,8 +273,9 @@ def main() -> None:
     print("Device:", device.type)
     print("CUDA available:", torch.cuda.is_available())
     print("GPU name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
+    print("Tokenizer type:", resolve_tokenizer_type())
 
-    tokenizer = Tokenizer.load(config.TOKENIZER_PATH)
+    tokenizer = load_tokenizer()
     model, checkpoint = load_model(args.checkpoint, device)
 
     if args.run_experiments:
@@ -270,11 +292,13 @@ def main() -> None:
         top_k=top_k,
         seed=args.seed,
         device=device,
+        stop_on_eos=not args.no_eos_stop,
     )
     print()
     safe_print(result["generated_text"])
     print()
     print(f"tokens/sec: {result['tokens_per_second']:.1f}")
+    print(f"characters/sec: {result['characters_per_second']:.1f}")
     if result["peak_gpu_memory_mb"] is not None:
         print(f"peak GPU memory: {result['peak_gpu_memory_mb']:.2f} MB")
 

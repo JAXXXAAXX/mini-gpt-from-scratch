@@ -1,7 +1,7 @@
-"""Reusable TinyStories story-generation evaluation harness for MiniGPT v1.
+"""Reusable TinyStories story-generation evaluation harness.
 
-Does not retrain or change the model architecture. Establishes a reproducible
-story-continuation baseline before v2 changes (BPE, longer context, etc.).
+Works with character (v1) and BPE (v2) tokenizers selected by config.TOKENIZER_TYPE.
+Does not retrain the model.
 """
 
 from __future__ import annotations
@@ -19,9 +19,14 @@ from torch.utils.data import DataLoader
 import config
 from evaluate import average_validation_loss, load_json, safe_print
 from generate import generate_once, load_model
-from src.data_utils import load_tinystories, prepare_text
+from src.data_utils import load_tinystories
 from src.dataset import TextDataset
-from src.tokenizer import Tokenizer
+from src.tokenizer_utils import (
+    encode_stories,
+    has_eos,
+    load_tokenizer,
+    resolve_tokenizer_type,
+)
 from src.trainer import perplexity
 
 # Permanent suite. Keep stable across v1 / v2 / v3 comparisons.
@@ -105,17 +110,19 @@ def lexical_metrics(text: str) -> dict:
     }
 
 
-def stopping_behavior(sample: dict, tokenizer: Tokenizer) -> dict:
-    # Character tokenizer has no EOS. Generation always appends exactly max_new_tokens.
+def stopping_behavior(sample: dict, tokenizer) -> dict:
     text = sample["generated_text"]
     continuation = text[len(sample["prompt"]) :] if text.startswith(sample["prompt"]) else text
     truncated = bool(continuation) and continuation[-1] not in ".!?\n"
+    eos_supported = bool(sample.get("eos_supported", has_eos(tokenizer)))
+    stopped_on_eos = bool(sample.get("stopped_on_eos", False))
+    hit_max = sample["tokens_generated"] >= sample["max_new_tokens"] and not stopped_on_eos
     return {
-        "eos_supported": False,
-        "stopped_naturally": False,
-        "hit_max_new_tokens": True,
-        "ended_in_obvious_truncation": truncated,
-        "tokens_appended": sample["max_new_tokens"],
+        "eos_supported": eos_supported,
+        "stopped_naturally": stopped_on_eos,
+        "hit_max_new_tokens": hit_max,
+        "ended_in_obvious_truncation": truncated and not stopped_on_eos,
+        "tokens_appended": sample["tokens_generated"],
     }
 
 
@@ -174,40 +181,16 @@ def empty_manual_rubric() -> dict:
     }
 
 
-def _stories_encodable(stories: list[str], tokenizer: Tokenizer) -> bool:
-    try:
-        tokenizer.encode(prepare_text(stories))
-        return True
-    except ValueError:
-        return False
-
-
-def load_validation_text(tokenizer: Tokenizer, num_valid: int = 500) -> tuple[str, dict]:
-    """Load the same validation slice style used for v1 training (500 stories).
-
-    Prefer a local TinyStories valid file when every character is in the saved
-    vocabulary. Otherwise use the Hugging Face streaming validation[:N] slice
-    that matches the original training pipeline.
-    """
-    local_valid = Path(config.VALID_PATH)
-    if local_valid.exists():
-        raw = local_valid.read_text(encoding="utf-8")
-        chunks = [chunk.strip() for chunk in re.split(r"\n\s*\n", raw) if chunk.strip()]
-        stories = chunks[:num_valid]
-        if len(stories) == num_valid and _stories_encodable(stories, tokenizer):
-            meta = {
-                "source": f"{local_valid.as_posix()} first {num_valid} stories",
-                "valid_stories": len(stories),
-            }
-            return prepare_text(stories), meta
-
-    print("Local validation text is missing or has OOV characters; using HF streaming slice...")
+def load_validation_stories(num_valid: int | None = None) -> tuple[list[str], dict]:
+    """Load the same validation story count used for training."""
+    num_valid = num_valid or config.NUM_VALID_STORIES
+    print("Loading TinyStories validation stories via HF streaming slice...")
     _train, valid_stories = load_tinystories(num_train=1, num_valid=num_valid)
     meta = {
         "source": f"huggingface:roneneldan/TinyStories validation[:{num_valid}]",
         "valid_stories": len(valid_stories),
     }
-    return prepare_text(valid_stories), meta
+    return valid_stories, meta
 
 
 def annotate_sample(sample: dict, tokenizer: Tokenizer) -> dict:
@@ -318,7 +301,8 @@ def build_markdown(result: dict) -> str:
         f"| Trained MiniGPT | {fmt(validation['loss'])} | {fmt(validation['perplexity'], 2)} |"
     )
 
-    return f"""# MiniGPT v1 Story Generation Evaluation
+    version_label = "v2 BPE" if model.get("tokenizer_type") == "bpe" else "v1"
+    return f"""# MiniGPT {version_label} Story Generation Evaluation
 
 ## 1. Model Configuration
 
@@ -359,12 +343,12 @@ Primary generation settings:
 
 Evaluated batches: {fmt(validation['batches_evaluated'], 0)}. Evaluated target tokens: {fmt(validation['tokens_evaluated'], 0)}.
 
-| Metric | v1 |
+| Metric | {version_label} |
 |---|---:|
 | Validation Loss | {fmt(validation['loss'])} |
 | Validation Perplexity | {fmt(validation['perplexity'], 2)} |
 | Parameters | {model['parameter_count']:,} |
-| Block Size | {model['block_size']} |
+| Block Size | {model['block_size']} tokenizer units |
 | Vocab Size | {model['vocab_size']} |
 
 Baseline comparison (perplexity is not story quality):
@@ -417,8 +401,10 @@ Fixed prompt: `{SENSITIVITY_PROMPT}` · seed `{config_gen['seed']}`
 | Metric | Result |
 |---|---:|
 | Mean suite tokens/sec | {fmt(performance['mean_suite_tokens_per_second'], 1)} |
+| Mean suite characters/sec | {fmt(performance.get('mean_suite_characters_per_second'), 1)} |
 | Peak inference GPU memory | {fmt(performance.get('peak_inference_gpu_memory_mb'), 2)} MB |
 | Training tokens/sec (from history, if available) | {fmt(performance.get('training_tokens_per_second'), 0)} |
+| Training characters/sec (from history, if available) | {fmt(performance.get('training_characters_per_second'), 0)} |
 | Peak training GPU memory (from history, if available) | {fmt(performance.get('peak_training_gpu_memory_mb'), 2)} MB |
 
 ## 10. Manual Story Quality Rubric
@@ -443,26 +429,25 @@ Each story-suite sample in `story_eval_v1.json` has:
 }}
 ```
 
-## 11. v1 Baseline Summary
+## 11. Baseline Summary
 
 | Field | Value |
 |---|---:|
 | Parameter count | {fmt(baseline.get('parameter_count'), 0)} |
 | Validation loss | {fmt(baseline.get('validation_loss'))} |
 | Validation perplexity | {fmt(baseline.get('validation_perplexity'), 2)} |
-| Context length | {fmt(baseline.get('context_length'), 0)} |
+| Context length | {fmt(baseline.get('context_length'), 0)} tokenizer units |
 | Tokenizer type | {baseline.get('tokenizer_type')} |
 | Generation speed (tokens/sec) | {fmt(baseline.get('generation_tokens_per_second'), 1)} |
+| Generation speed (characters/sec) | {fmt(baseline.get('generation_characters_per_second'), 1)} |
 | Training speed (tokens/sec) | {fmt(baseline.get('training_tokens_per_second'), 0)} |
-
-This report is the **before** column for v2 story-generation comparisons.
+| Training speed (characters/sec) | {fmt(baseline.get('training_characters_per_second'), 0)} |
 
 ## 12. Limitations
 
-- Character-level tokenizer and short context ({model['block_size']} characters)
-- No EOS / story-boundary token (`EOS supported: false`)
-- Generation always hits `max_new_tokens`
-- TinyStories next-character perplexity is not a full story-quality score
+- Context length is {model['block_size']} tokenizer units (character tokens and BPE tokens are not comparable as text span)
+- Tokens/sec alone is misleading across tokenizer types; prefer characters/sec
+- TinyStories next-token perplexity is not a full story-quality score
 - Manual rubric scores are not filled automatically
 - Architecture compute benchmarks are separate files and were not replaced
 
@@ -476,9 +461,9 @@ experiments/transformer_block_benchmark.*
 experiments/minigpt_forward_benchmark.*
 ```
 
-## 13. Metrics to Beat in v2
+## 13. Metrics to Beat Next
 
-- lower TinyStories validation loss/perplexity
+- lower TinyStories validation loss/perplexity under controlled settings
 - higher Distinct-2 / Distinct-3 without becoming incoherent
 - lower repeated n-gram rate
 - better manually rated coherence
@@ -486,29 +471,38 @@ experiments/minigpt_forward_benchmark.*
 - better story progression
 - longer usable context
 - better stopping behavior
-- acceptable generation throughput
+- acceptable generation throughput in characters/sec
 
-Do not assign numerical pass bars until this v1 harness has been reviewed.
+Do not assign numerical pass bars until human review.
 """
 
 
 def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer_type = resolve_tokenizer_type()
+    use_boundaries = tokenizer_type == "bpe"
     print("Device:", device.type)
     print("CUDA available:", torch.cuda.is_available())
     print("GPU name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
+    print("Tokenizer type:", tokenizer_type)
+    print("Checkpoint:", config.BEST_CHECKPOINT)
 
-    tokenizer = Tokenizer.load(config.TOKENIZER_PATH)
+    tokenizer = load_tokenizer()
     model, checkpoint = load_model(config.BEST_CHECKPOINT, device)
     model_config = checkpoint["model_config"]
+    if model_config.get("tokenizer_type") and model_config["tokenizer_type"] != tokenizer_type:
+        raise RuntimeError(
+            f"Checkpoint tokenizer_type={model_config['tokenizer_type']!r} does not match "
+            f"config.TOKENIZER_TYPE={tokenizer_type!r}."
+        )
     parameter_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     history = load_json(config.HISTORY_PATH) or {}
     final_eval = load_json(config.FINAL_EVAL_JSON) or {}
 
-    print("Loading validation text...")
-    valid_text, valid_meta = load_validation_text(tokenizer, num_valid=500)
-    valid_ids = tokenizer.encode(valid_text)
+    print("Loading validation stories...")
+    valid_stories, valid_meta = load_validation_stories()
+    valid_ids = encode_stories(tokenizer, valid_stories, use_story_boundaries=use_boundaries)
     valid_loader = DataLoader(
         TextDataset(valid_ids, model.block_size),
         batch_size=config.BATCH_SIZE,
@@ -522,8 +516,7 @@ def main() -> None:
     tokens_evaluated = batches * config.BATCH_SIZE * model.block_size
     val_ppl = perplexity(val_loss)
 
-    baselines = {}
-    if final_eval.get("baselines"):
+    if tokenizer_type == "char" and final_eval.get("baselines"):
         baselines = {
             "uniform_loss": final_eval["baselines"].get("uniform_loss"),
             "uniform_perplexity": final_eval["baselines"].get("uniform_perplexity"),
@@ -541,7 +534,7 @@ def main() -> None:
             "untrained_perplexity": None,
             "trained_loss": val_loss,
             "trained_perplexity": val_ppl,
-            "source": "computed_partial",
+            "source": "computed_for_active_tokenizer",
         }
 
     gen_cfg = {
@@ -639,10 +632,13 @@ def main() -> None:
         if item.get("peak_gpu_memory_mb") is not None
     ]
     mean_speed = mean_or_none([item["tokens_per_second"] for item in story_suite])
+    mean_char_speed = mean_or_none(
+        [item.get("characters_per_second") for item in story_suite]
+    )
 
     result = {
         "model": {
-            "tokenizer_type": "character",
+            "tokenizer_type": tokenizer_type,
             "vocab_size": model.vocab_size,
             "block_size": model.block_size,
             "embedding_dim": model.embedding_dim,
@@ -662,6 +658,7 @@ def main() -> None:
             "valid_tokens": len(valid_ids),
             "vocab_size": model.vocab_size,
             "validation_source": valid_meta.get("source"),
+            "story_boundaries": use_boundaries,
         },
         "validation": {
             "loss": val_loss,
@@ -676,8 +673,10 @@ def main() -> None:
         "sampling_sensitivity": sensitivity,
         "performance": {
             "mean_suite_tokens_per_second": mean_speed,
+            "mean_suite_characters_per_second": mean_char_speed,
             "peak_inference_gpu_memory_mb": max(peak_infer) if peak_infer else None,
             "training_tokens_per_second": history.get("tokens_per_second"),
+            "training_characters_per_second": history.get("characters_per_second"),
             "peak_training_gpu_memory_mb": history.get("peak_gpu_memory_mb"),
         },
         "manual_rubric": empty_manual_rubric(),
@@ -686,9 +685,11 @@ def main() -> None:
             "validation_loss": val_loss,
             "validation_perplexity": val_ppl,
             "context_length": model.block_size,
-            "tokenizer_type": "character",
+            "tokenizer_type": tokenizer_type,
             "generation_tokens_per_second": mean_speed,
+            "generation_characters_per_second": mean_char_speed,
             "training_tokens_per_second": history.get("tokens_per_second"),
+            "training_characters_per_second": history.get("characters_per_second"),
         },
         "preserved_compute_benchmarks": [
             "experiments/single_head_benchmark.json",
