@@ -10,7 +10,13 @@ A small GPT-style language model built in PyTorch, one stage at a time.
 - Single-head attention ✅
 - Multi-head attention ✅
 - Transformer block ✅
-- Stacked Transformer ⏳
-- Language model head ⏳
-- Training loop ⏳
-- Generation ⏳
+- Stacked Transformer ✅
+- LM head ✅
+- Cross-entropy loss ✅
+- Training loop ✅
+- Validation ✅
+- Checkpointing ✅
+- Text generation ✅
+- Temperature sampling ✅
+- Top-k sampling ✅
+- Final evaluation ⏳

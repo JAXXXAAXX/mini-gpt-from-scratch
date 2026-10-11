@@ -1,4 +1,4 @@
-"""Token IDs -> embeddings -> one causal self-attention head."""
+"""Token IDs -> stacked Transformer blocks -> vocabulary logits."""
 
 import math
 
@@ -8,32 +8,143 @@ import torch.nn.functional as F
 
 
 class MiniGPT(nn.Module):
-    """Input representation only. Attention comes later."""
+    """Token ids to next-token logits.
 
-    def __init__(self, vocab_size: int, block_size: int, embedding_dim: int):
+    Embeddings produce [B, T, C]. Each Transformer block keeps that shape.
+    The LM head then maps every position to one raw score per vocabulary token.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        block_size: int,
+        embedding_dim: int,
+        num_heads: int,
+        num_layers: int,
+        dropout: float,
+    ):
         super().__init__()
+        if num_layers < 1:
+            raise ValueError("num_layers must be at least 1.")
+        self.vocab_size = vocab_size
         self.block_size = block_size
+        self.embedding_dim = embedding_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
         # Token IDs are integer indexes, not semantic vectors.
         # This table maps each id to a learnable vector of length embedding_dim.
         self.token_embedding = nn.Embedding(vocab_size, embedding_dim)
         # Each position 0 .. block_size-1 gets its own learnable vector.
         self.position_embedding = nn.Embedding(block_size, embedding_dim)
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(embedding_dim, num_heads, block_size, dropout)
+                for _ in range(num_layers)
+            ]
+        )
+        # Normalize the hidden states before they are scored against the vocabulary.
+        self.final_ln = nn.LayerNorm(embedding_dim)
+        self.lm_head = nn.Linear(embedding_dim, vocab_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_details: bool = False):
         # x holds token ids with shape [B, T].
-        B, T = x.shape
-        if T > self.block_size:
+        batch_size, seq_len = x.shape
+        if seq_len > self.block_size:
             raise ValueError(
-                f"Batch of {B} sequences has length {T}, which is longer than block_size {self.block_size}."
+                f"Batch of {batch_size} sequences has length {seq_len}, "
+                f"which is longer than block_size {self.block_size}."
             )
 
         # Positions are 0, 1, 2, ..., T - 1, on the same device as the token ids.
-        positions = torch.arange(T, device=x.device)
+        positions = torch.arange(seq_len, device=x.device)
         token_emb = self.token_embedding(x)  # [B, T] -> [B, T, C]
         position_emb = self.position_embedding(positions)  # [T] -> [T, C]
-        # Both tensors use embedding_dim, so [T, C] broadcasts across the
-        # batch of size B and adds position information to every token vector.
-        return token_emb + position_emb  # [B, T, C]
+        # Both tensors use embedding_dim, so [T, C] broadcasts across the batch.
+        hidden = token_emb + position_emb  # [B, T, C]
+
+        block_outputs = []
+        for block in self.blocks:
+            hidden = block(hidden)
+            if return_details:
+                block_outputs.append(hidden)
+        normalized = self.final_ln(hidden)
+        # logits[b, t, :] is one raw score for every vocabulary token at that position.
+        # logits[0, 10, :] is the next-token scores for sequence 0 at position 10.
+        # Softmax is not applied here. CrossEntropyLoss combines log-softmax and
+        # negative log likelihood, and it is more stable when given these raw scores.
+        logits = self.lm_head(normalized)  # [B, T, C] -> [B, T, vocab_size]
+        if not return_details:
+            return logits
+        return logits, {
+            "token_ids": x,
+            "embeddings": token_emb + position_emb,
+            "blocks": block_outputs,
+            "final_ln": normalized,
+            "logits": logits,
+        }
+
+    def architecture_summary(self) -> str:
+        return (
+            "MiniGPT\n"
+            "├── Token Embedding\n"
+            "├── Position Embedding\n"
+            f"├── Transformer Blocks × {self.num_layers}\n"
+            "├── Final LayerNorm\n"
+            "└── LM Head\n"
+            "\n"
+            f"Embedding Dim: {self.embedding_dim}\n"
+            f"Heads: {self.num_heads}\n"
+            f"Layers: {self.num_layers}\n"
+            f"Context Length: {self.block_size}\n"
+            f"Vocabulary Size: {self.vocab_size}"
+        )
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        token_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
+        """Sample new tokens one at a time and append them to the context.
+
+        Softmax is used only here. Training keeps raw logits for CrossEntropyLoss.
+        """
+        if token_ids.ndim != 2:
+            raise ValueError(f"token_ids must have shape [B, T], got {tuple(token_ids.shape)}.")
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be greater than 0.")
+        if temperature <= 0:
+            raise ValueError("temperature must be greater than 0.")
+        if top_k is not None and top_k < 1:
+            raise ValueError("top_k must be None or greater than 0.")
+
+        was_training = self.training
+        self.eval()
+        generated = token_ids
+        for _ in range(max_new_tokens):
+            # The model was trained with at most block_size tokens of context.
+            context = generated[:, -self.block_size :]
+            logits = self(context)
+            if not torch.isfinite(logits).all():
+                raise RuntimeError("Generation produced NaN or infinite logits.")
+            # Only the last position predicts the token that comes next.
+            next_logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                keep = min(top_k, next_logits.size(-1))
+                values, _ = torch.topk(next_logits, keep)
+                cutoff = values[:, -1].unsqueeze(-1)
+                next_logits = next_logits.masked_fill(next_logits < cutoff, float("-inf"))
+            probabilities = F.softmax(next_logits, dim=-1)
+            next_token = torch.multinomial(probabilities, num_samples=1)
+            if not ((next_token >= 0) & (next_token < self.vocab_size)).all():
+                raise RuntimeError("Sampled a token id outside the vocabulary.")
+            generated = torch.cat([generated, next_token], dim=1)
+
+        if was_training:
+            self.train()
+        return generated
 
 
 class SelfAttentionHead(nn.Module):

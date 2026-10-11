@@ -35,6 +35,8 @@ WIDE_MARKDOWN_PATH = Path("experiments/single_head_128_benchmark.md")
 COMPARISON_MARKDOWN_PATH = Path("experiments/attention_comparison.md")
 BLOCK_JSON_PATH = Path("experiments/transformer_block_benchmark.json")
 BLOCK_MARKDOWN_PATH = Path("experiments/transformer_block_benchmark.md")
+MINIGPT_JSON_PATH = Path("experiments/minigpt_forward_benchmark.json")
+MINIGPT_MARKDOWN_PATH = Path("experiments/minigpt_forward_benchmark.md")
 
 
 def _synchronize(device: torch.device) -> None:
@@ -51,12 +53,20 @@ def measure_module(
     warmup_iterations: int,
     measured_iterations: int,
     device: torch.device,
+    vocab_size: int | None = None,
 ) -> dict:
-    """Time forward, then forward plus backward, for any [B, T, C] module."""
+    """Time forward, then forward plus backward.
+
+    By default the input is a float tensor [B, T, C]. Pass vocab_size when the
+    module consumes token ids [B, T], as MiniGPT does.
+    """
     module = module.to(device)
     parameter_count = sum(p.numel() for p in module.parameters() if p.requires_grad)
     tokens = batch_size * sequence_length
-    x = torch.randn(batch_size, sequence_length, embedding_dim, device=device)
+    if vocab_size is None:
+        x = torch.randn(batch_size, sequence_length, embedding_dim, device=device)
+    else:
+        x = torch.randint(0, vocab_size, (batch_size, sequence_length), device=device)
 
     module.eval()
     with torch.no_grad():
@@ -711,4 +721,117 @@ This is a compute and shape check for a single block. It is not a trained langua
 ## Next Step
 
 Stack several copies of this block. After the stack, add a final LayerNorm and a language-model head, then train with cross-entropy loss.
+"""
+
+
+def minigpt_parameter_breakdown(model: nn.Module) -> dict:
+    """Count trainable parameters in each part of the full forward model."""
+
+    def count(module: nn.Module) -> int:
+        return sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
+
+    groups = {
+        "token_embedding_parameters": count(model.token_embedding),
+        "position_embedding_parameters": count(model.position_embedding),
+        "transformer_block_parameters": count(model.blocks),
+        "final_layernorm_parameters": count(model.final_ln),
+        "lm_head_parameters": count(model.lm_head),
+    }
+    total = count(model)
+    if sum(groups.values()) != total:
+        raise RuntimeError("MiniGPT parameter groups do not add up to the total.")
+    groups["total_parameters"] = total
+    groups["total_parameters_millions"] = total / 1_000_000
+    return groups
+
+
+def generate_minigpt_forward_report(result: dict) -> str:
+    """Render the full-model forward report from one benchmark dictionary."""
+    shapes = result["shapes"]
+    rows = "\n".join(
+        f"| {item['stage']} | `{item['symbolic']}` | `{item['measured']}` |"
+        for item in shapes
+    )
+    params = result["parameter_groups"]
+    gpu_name = result["gpu_name"] or "none"
+    cuda_version = result["cuda_version"] or "none"
+    memory = _memory_cell(result)
+    millions = params["total_parameters_millions"]
+    return f"""# MiniGPT Forward Architecture Report
+
+## Architecture
+
+```text
+{result["architecture_summary"]}
+```
+
+Token ids become vectors, pass through {result["num_layers"]} Transformer blocks, and the LM head scores every vocabulary token. The forward pass returns raw logits. It does not apply softmax.
+
+## Configuration
+
+- Device: `{result["device"]}`
+- GPU name: {gpu_name}
+- PyTorch version: {result["pytorch_version"]}
+- CUDA version: {cuda_version}
+- Batch size: {result["batch_size"]}
+- Sequence length: {result["sequence_length"]}
+- Embedding dimension: {result["embedding_dim"]}
+- Heads: {result["num_heads"]}
+- Layers: {result["num_layers"]}
+- Vocabulary size: {result["vocab_size"]}
+- Dropout: {result["dropout"]}
+- Warm-up iterations: {result["warmup_iterations"]}
+- Measured iterations: {result["measured_iterations"]}
+- Logits finite: {result["logits_finite"]}
+- Gradients present: {result["gradients_present"]}
+
+## Shape Flow
+
+| Stage | Shape | Measured |
+|---|---|---|
+{rows}
+
+## Parameter Breakdown
+
+| Part | Parameters |
+|---|---:|
+| Token Embedding | {params["token_embedding_parameters"]:,} |
+| Position Embedding | {params["position_embedding_parameters"]:,} |
+| Transformer Blocks | {params["transformer_block_parameters"]:,} |
+| Final LayerNorm | {params["final_layernorm_parameters"]:,} |
+| LM Head | {params["lm_head_parameters"]:,} |
+| Total | {params["total_parameters"]:,} |
+
+{params["total_parameters"]:,} parameters ({millions:.2f}M).
+
+Adding one Transformer block adds the same block parameter count again. Embeddings, the final LayerNorm, and the LM head stay fixed.
+
+## Computational Performance
+
+| Metric | Result |
+|---|---:|
+| Trainable Parameters | {params["total_parameters"]:,} |
+| Forward Latency | {result["forward_latency_ms"]:.3f} ms |
+| Forward + Backward Latency | {result["forward_backward_latency_ms"]:.3f} ms |
+| Throughput | {_fmt_number(result["tokens_per_second"], 0)} tokens/sec |
+| Peak GPU Memory | {memory} |
+
+## Logits Interpretation
+
+`logits[b, t, :]` holds one raw score for every vocabulary token. `logits[0, 10, :]` is the model's next-token scores for sequence 0 at position 10. These are not probabilities. CrossEntropyLoss applies log-softmax internally, together with negative log likelihood, and that combination is more stable on raw logits.
+
+## Gradient Verification
+
+A dummy objective, `logits.mean()`, produced finite gradients for the token embedding, an attention projection, a feed-forward weight, the final LayerNorm, and the LM head. This checks that gradients can flow. It is not language-model training.
+
+## Limitations
+
+- No cross-entropy loss against the next token is computed.
+- There is no optimizer, training loop, validation loop, or checkpointing.
+- Text generation is not implemented.
+- Runtime measurements can vary with GPU state and other system load.
+
+## Next Step
+
+Train with cross-entropy on the shifted targets from `TextDataset`. The loss should compare `logits[:, :-1, :]` with the next token ids, or use the existing `(x, y)` pairs directly.
 """

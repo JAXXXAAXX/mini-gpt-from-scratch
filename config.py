@@ -12,7 +12,7 @@ BLOCK_SIZE = 64
 EMBEDDING_DIM = 128
 
 NUM_HEADS = 4
-NUM_LAYERS = 2
+NUM_LAYERS = 4
 
 DROPOUT = 0.1
 
@@ -22,6 +22,29 @@ DROPOUT = 0.1
 BATCH_SIZE = 32
 LEARNING_RATE = 3e-4
 
-NUM_EPOCHS = 10
+MAX_STEPS = 1000
+EVAL_INTERVAL = 100
+EVAL_BATCHES = 20
 
-DEVICE = "cpu"
+GRAD_CLIP = 1.0
+
+# Set to a checkpoint path to continue. Fresh runs fit the tokenizer again.
+RESUME_CHECKPOINT = None
+
+# Overfit one batch for this many steps when train.py is run with --overfit.
+OVERFIT_STEPS = 40
+
+CHECKPOINT_DIR = "checkpoints"
+HISTORY_PATH = "experiments/training_history.json"
+REPORT_PATH = "experiments/training_report.md"
+LOSS_CURVE_PATH = "experiments/loss_curve.png"
+
+# Generation
+BEST_CHECKPOINT = "checkpoints/best.pt"
+GENERATION_PROMPT = "Once there was"
+GENERATION_MAX_NEW_TOKENS = 300
+GENERATION_TEMPERATURE = 0.8
+GENERATION_TOP_K = 20
+GENERATION_SEED = 42
+GENERATION_SAMPLES_PATH = "experiments/generation_samples.json"
+GENERATION_REPORT_PATH = "experiments/generation_report.md"
