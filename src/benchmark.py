@@ -33,6 +33,8 @@ MULTI_MARKDOWN_PATH = Path("experiments/multi_head_benchmark.md")
 WIDE_JSON_PATH = Path("experiments/single_head_128_benchmark.json")
 WIDE_MARKDOWN_PATH = Path("experiments/single_head_128_benchmark.md")
 COMPARISON_MARKDOWN_PATH = Path("experiments/attention_comparison.md")
+BLOCK_JSON_PATH = Path("experiments/transformer_block_benchmark.json")
+BLOCK_MARKDOWN_PATH = Path("experiments/transformer_block_benchmark.md")
 
 
 def _synchronize(device: torch.device) -> None:
@@ -588,3 +590,125 @@ Add a Transformer block: residual connections, layer normalization, and a feed-f
 
 def load_benchmark(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def block_parameter_breakdown(block: nn.Module) -> dict:
+    """Count trainable parameters in each part of one Transformer block."""
+
+    def count(module: nn.Module) -> int:
+        return sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
+
+    attention = count(block.attention)
+    ffn = count(block.ffn)
+    layernorm = count(block.ln1) + count(block.ln2)
+    total = count(block)
+    if attention + ffn + layernorm != total:
+        raise RuntimeError("Transformer block parameter groups do not add up to the total.")
+    return {
+        "attention_parameters": attention,
+        "ffn_parameters": ffn,
+        "layernorm_parameters": layernorm,
+        "total_parameters": total,
+    }
+
+
+def generate_transformer_block_report(result: dict) -> str:
+    """Render the Transformer block report from one benchmark dictionary."""
+    shapes = result["shapes"]
+    rows = "\n".join(
+        f"| {item['stage']} | `{item['symbolic']}` | `{item['measured']}` |"
+        for item in shapes
+    )
+    params = result["parameters"]
+    ffn_share = 100.0 * params["ffn_parameters"] / params["total_parameters"]
+    gpu_name = result["gpu_name"] or "none"
+    cuda_version = result["cuda_version"] or "none"
+    memory = _memory_cell(result)
+    return f"""# Transformer Block Benchmark Report
+
+## Architecture
+
+Pre-Norm Transformer block. Each sublayer is normalized first, then added back to its input.
+
+```text
+X
+│
+├── LayerNorm
+│      ↓
+│   Multi-Head Attention
+│      ↓
+└──── + Residual
+       ↓
+       X
+       │
+       ├── LayerNorm
+       │      ↓
+       │     FFN
+       │      ↓
+       └──── + Residual
+              ↓
+            Output
+```
+
+Attention moves information across tokens. The feed-forward network transforms each token vector on its own.
+
+## Configuration
+
+- Device: `{result["device"]}`
+- GPU name: {gpu_name}
+- PyTorch version: {result["pytorch_version"]}
+- CUDA version: {cuda_version}
+- Batch size: {result["batch_size"]}
+- Sequence length: {result["sequence_length"]}
+- Embedding dimension: {result["embedding_dim"]}
+- Heads: {result["num_heads"]}
+- Dropout: {result["dropout"]}
+- Warm-up iterations: {result["warmup_iterations"]}
+- Measured iterations: {result["measured_iterations"]}
+- Output finite: {result["output_finite"]}
+- Gradients present: {result["gradients_present"]}
+
+## Shape Flow
+
+| Stage | Shape | Measured |
+|---|---|---|
+{rows}
+
+## Parameter Breakdown
+
+| Part | Parameters |
+|---|---:|
+| Attention | {params["attention_parameters"]:,} |
+| Feed Forward | {params["ffn_parameters"]:,} |
+| LayerNorm | {params["layernorm_parameters"]:,} |
+| Total | {params["total_parameters"]:,} |
+
+The feed-forward network holds {ffn_share:.1f}% of the block's trainable parameters.
+
+## Computational Performance
+
+| Metric | Result |
+|---|---:|
+| Trainable Parameters | {params["total_parameters"]:,} |
+| Forward Latency | {result["forward_latency_ms"]:.3f} ms |
+| Forward + Backward Latency | {result["forward_backward_latency_ms"]:.3f} ms |
+| Throughput | {_fmt_number(result["tokens_per_second"], 0)} tokens/sec |
+| Peak GPU Memory | {memory} |
+
+## Interpretation
+
+One block preserves the input shape and contains {params["total_parameters"]:,} trainable parameters. On this run a forward + backward step processed about {_fmt_number(result["tokens_per_second"], 0)} tokens/sec. Peak GPU memory was {memory}. Most of the parameters sit in the feed-forward expansion from {result["embedding_dim"]} to {4 * result["embedding_dim"]} and back.
+
+This is a compute and shape check for a single block. It is not a trained language model.
+
+## Limitations
+
+- Only one Transformer block is measured.
+- Blocks are not stacked yet.
+- There is no final LayerNorm, language-model head, loss, or training loop.
+- Runtime measurements can vary with GPU state and other system load.
+
+## Next Step
+
+Stack several copies of this block. After the stack, add a final LayerNorm and a language-model head, then train with cross-entropy loss.
+"""

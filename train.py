@@ -1,8 +1,12 @@
+import json
+
 import torch
 from torch.utils.data import DataLoader
 
 import config
 from src.benchmark import (
+    BLOCK_JSON_PATH,
+    BLOCK_MARKDOWN_PATH,
     COMPARISON_CONFIG,
     COMPARISON_MARKDOWN_PATH,
     JSON_PATH,
@@ -12,8 +16,10 @@ from src.benchmark import (
     WIDE_JSON_PATH,
     WIDE_MARKDOWN_PATH,
     assemble_result,
+    block_parameter_breakdown,
     device_metadata,
     generate_attention_comparison,
+    generate_transformer_block_report,
     load_benchmark,
     measure_module,
     print_baseline_summary,
@@ -23,7 +29,7 @@ from src.benchmark import (
 )
 from src.data_utils import load_tinystories, prepare_text
 from src.dataset import TextDataset
-from src.model import MiniGPT, MultiHeadAttention, SelfAttentionHead
+from src.model import MiniGPT, MultiHeadAttention, SelfAttentionHead, TransformerBlock
 from src.tokenizer import Tokenizer
 
 
@@ -114,6 +120,7 @@ def main():
 
     check_self_attention(train_x, output, torch.device(device))
     check_multi_head_attention(output, torch.device(device))
+    check_transformer_block(output, torch.device(device))
 
 
 def check_self_attention(token_ids: torch.Tensor, embedded: torch.Tensor, device: torch.device):
@@ -294,6 +301,119 @@ def check_multi_head_attention(embedded: torch.Tensor, device: torch.device):
     print(MULTI_MARKDOWN_PATH.as_posix())
     print(WIDE_MARKDOWN_PATH.as_posix())
     print(COMPARISON_MARKDOWN_PATH.as_posix())
+
+
+def check_transformer_block(embedded: torch.Tensor, device: torch.device):
+    """Check one Pre-Norm block on a real batch, then record its compute baseline."""
+    settings = COMPARISON_CONFIG
+    block = TransformerBlock(
+        embedding_dim=settings["embedding_dim"],
+        num_heads=settings["num_heads"],
+        block_size=settings["sequence_length"],
+        dropout=settings["dropout"],
+    ).to(device)
+
+    block.eval()
+    with torch.no_grad():
+        output, details = block(embedded, return_details=True)
+
+    print()
+    print("Input shape:         ", tuple(details["input"].shape))
+    print("After LayerNorm 1:   ", tuple(details["layernorm_1"].shape))
+    print("After Attention:     ", tuple(details["attention"].shape))
+    print("After Residual 1:    ", tuple(details["residual_1"].shape))
+    print("After LayerNorm 2:   ", tuple(details["layernorm_2"].shape))
+    print("After FFN:           ", tuple(details["ffn"].shape))
+    print("After Residual 2:    ", tuple(details["output"].shape))
+    print("Final output shape:  ", tuple(output.shape))
+
+    if tuple(output.shape) != tuple(embedded.shape):
+        raise RuntimeError(
+            f"Expected Transformer block output {tuple(embedded.shape)}, got {tuple(output.shape)}."
+        )
+    for name, tensor in details.items():
+        if tuple(tensor.shape) != tuple(embedded.shape):
+            raise RuntimeError(f"{name} changed shape to {tuple(tensor.shape)}.")
+    if not torch.isfinite(output).all():
+        raise RuntimeError("Transformer block output contains NaN or infinity.")
+    if torch.cuda.is_available() and output.device.type != "cuda":
+        raise RuntimeError(f"Expected Transformer block output on CUDA, got {output.device}.")
+
+    block.zero_grad(set_to_none=True)
+    block.train()
+    trained = block(embedded.detach())
+    if not torch.isfinite(trained).all():
+        raise RuntimeError("Transformer block training forward contains NaN or infinity.")
+    trained.mean().backward()
+    watched = {
+        "attention projection weights": block.attention.output_projection.weight.grad,
+        "FFN expand weights": block.ffn.expand.weight.grad,
+        "FFN project weights": block.ffn.project.weight.grad,
+        "LayerNorm 1 weight": block.ln1.weight.grad,
+        "LayerNorm 2 weight": block.ln2.weight.grad,
+    }
+    for name, grad in watched.items():
+        if grad is None or not torch.isfinite(grad).all() or torch.count_nonzero(grad) == 0:
+            raise RuntimeError(f"{name} did not receive a finite gradient.")
+
+    params = block_parameter_breakdown(block)
+    print("Attention parameters:     ", params["attention_parameters"])
+    print("FFN parameters:           ", params["ffn_parameters"])
+    print("LayerNorm parameters:     ", params["layernorm_parameters"])
+    print("Total block parameters:   ", params["total_parameters"])
+
+    measured = measure_module(
+        block,
+        batch_size=settings["batch_size"],
+        sequence_length=settings["sequence_length"],
+        embedding_dim=settings["embedding_dim"],
+        warmup_iterations=settings["warmup_iterations"],
+        measured_iterations=settings["measured_iterations"],
+        device=device,
+    )
+    if measured["parameter_count"] != params["total_parameters"]:
+        raise RuntimeError("Benchmark parameter count does not match the block breakdown.")
+
+    stage_names = [
+        ("Input", details["input"]),
+        ("LayerNorm 1", details["layernorm_1"]),
+        ("Multi-Head Attention", details["attention"]),
+        ("Residual 1", details["residual_1"]),
+        ("LayerNorm 2", details["layernorm_2"]),
+        ("Feed Forward", details["ffn"]),
+        ("Final Output", details["output"]),
+    ]
+    result = {
+        "model": "transformer_block",
+        **device_metadata(device),
+        "batch_size": settings["batch_size"],
+        "sequence_length": settings["sequence_length"],
+        "embedding_dim": settings["embedding_dim"],
+        "num_heads": settings["num_heads"],
+        "dropout": settings["dropout"],
+        "warmup_iterations": settings["warmup_iterations"],
+        "measured_iterations": settings["measured_iterations"],
+        **measured,
+        "parameters": params,
+        "shapes": [
+            {"stage": stage, "symbolic": "[B, T, C]", "measured": list(tensor.shape)}
+            for stage, tensor in stage_names
+        ],
+        "output_finite": True,
+        "gradients_present": True,
+    }
+    BLOCK_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BLOCK_JSON_PATH.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    BLOCK_MARKDOWN_PATH.write_text(generate_transformer_block_report(result), encoding="utf-8")
+
+    print()
+    print_baseline_summary(result, "=== Transformer Block Baseline ===")
+    print()
+    print("Saved benchmark JSON:")
+    print(BLOCK_JSON_PATH.as_posix())
+    print()
+    print("Saved benchmark report:")
+    print(BLOCK_MARKDOWN_PATH.as_posix())
 
 
 if __name__ == "__main__":

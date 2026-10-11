@@ -6,9 +6,11 @@ A small GPT-style language model built in PyTorch, one stage at a time.
 
 - Tokenizer ✅
 - Dataset pipeline ✅
-- Token embedding ✅
-- Position embedding ✅
+- Embeddings ✅
 - Single-head attention ✅
 - Multi-head attention ✅
-- Benchmark system ✅
-- Transformer block ⏳
+- Transformer block ✅
+- Stacked Transformer ⏳
+- Language model head ⏳
+- Training loop ⏳
+- Generation ⏳

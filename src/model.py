@@ -153,3 +153,62 @@ class MultiHeadAttention(nn.Module):
             "output": output,
             "attention_weights": weight_matrices,
         }
+
+
+class FeedForward(nn.Module):
+    """Per-token nonlinear map. It does not mix positions in the sequence.
+
+    Attention gathers information across tokens. This network then transforms
+    each token vector on its own: the linear layers act only on the last dimension.
+    """
+
+    def __init__(self, embedding_dim: int, dropout: float):
+        super().__init__()
+        hidden_dim = 4 * embedding_dim
+        self.expand = nn.Linear(embedding_dim, hidden_dim)
+        self.activation = nn.GELU()
+        self.project = nn.Linear(hidden_dim, embedding_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # C -> 4C gives each token a wider intermediate feature space, then back to C.
+        hidden = self.activation(self.expand(x))
+        return self.dropout(self.project(hidden))
+
+
+class TransformerBlock(nn.Module):
+    """One Pre-Norm block: attention, then a feed-forward network, each with a residual."""
+
+    def __init__(self, embedding_dim: int, num_heads: int, block_size: int, dropout: float):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(embedding_dim)
+        self.attention = MultiHeadAttention(embedding_dim, num_heads, block_size, dropout)
+        self.ln2 = nn.LayerNorm(embedding_dim)
+        self.ffn = FeedForward(embedding_dim, dropout)
+
+    def forward(self, x: torch.Tensor, return_details: bool = False):
+        # LayerNorm stabilizes the representation before the sublayer.
+        normed = self.ln1(x)
+        # Attention is token-to-token communication: each token reads earlier tokens.
+        attended = self.attention(normed)
+        # The residual keeps the original x and gives gradients a direct path backward.
+        residual_1 = x + attended
+
+        normed_2 = self.ln2(residual_1)
+        # The FFN is a per-token nonlinear transform. It does not mix sequence positions.
+        transformed = self.ffn(normed_2)
+        output = residual_1 + transformed
+
+        if output.shape != x.shape:
+            raise RuntimeError(f"Transformer block changed shape from {tuple(x.shape)} to {tuple(output.shape)}.")
+        if not return_details:
+            return output
+        return output, {
+            "input": x,
+            "layernorm_1": normed,
+            "attention": attended,
+            "residual_1": residual_1,
+            "layernorm_2": normed_2,
+            "ffn": transformed,
+            "output": output,
+        }
