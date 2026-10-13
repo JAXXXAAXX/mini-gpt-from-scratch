@@ -14,7 +14,9 @@ TOKENIZER_TYPE = "bpe"
 # "v2_1_ctx256"           BPE model, context 256, batch 8, 1000 steps
 # "v2_2_ctx256_longtrain" same as v2.1, resumed through 3000 total steps
 # "v2_3_rope_ctx256"      same budget as v2.2, fresh weights, RoPE on Q and K
-EXPERIMENT = "v2_3_rope_ctx256"
+# "v2_4_stories20k"       same RoPE model, 20,000 stories, 12,000 steps
+# "v2_5_width256"         same data/budget as v2.4, embedding 256 and 8 heads
+EXPERIMENT = "v2_5_width256"
 
 CHAR_TOKENIZER_PATH = "data/processed/tokenizer.json"
 BPE_TOKENIZER_PATH = "data/processed/bpe_tokenizer.json"
@@ -42,6 +44,19 @@ V2_2_MAX_STEPS = 3000
 V2_3_BLOCK_SIZE = 256
 V2_3_BATCH_SIZE = 8
 V2_3_MAX_STEPS = 3000
+# Four times the v2.3 story slice and four times the steps, so the pass count stays near v2.3.
+V2_4_BLOCK_SIZE = 256
+V2_4_BATCH_SIZE = 8
+V2_4_MAX_STEPS = 12000
+V2_4_TRAIN_STORIES = 20000
+# Same stories, steps, RoPE, and context as v2.4. Only width changes.
+V2_5_BLOCK_SIZE = 256
+V2_5_BATCH_SIZE = 8
+V2_5_MAX_STEPS = 12000
+V2_5_TRAIN_STORIES = 20000
+V2_5_EMBEDDING_DIM = 256
+V2_5_NUM_HEADS = 8
+V2_5_NUM_LAYERS = 4
 
 BLOCK_SIZE = V2_BPE_BLOCK_SIZE
 EMBEDDING_DIM = 128
@@ -121,13 +136,64 @@ V2_3_ROPE_LOSS_CURVE_PATH = "experiments/loss_curve_v2_3_rope_ctx256.png"
 V2_3_ROPE_STORY_EVAL_JSON = "experiments/story_eval_v2_3_rope_ctx256.json"
 V2_3_ROPE_STORY_EVAL_REPORT = "experiments/story_eval_v2_3_rope_ctx256.md"
 
+# v2.4 keeps the v2.3 RoPE body and the existing BPE file. It does not resume v2.3.
+V2_4_BEST_CHECKPOINT = "checkpoints/v2_4_stories20k_best.pt"
+V2_4_LATEST_CHECKPOINT = "checkpoints/v2_4_stories20k_latest.pt"
+V2_4_HISTORY_PATH = "experiments/training_history_v2_4_stories20k.json"
+V2_4_REPORT_PATH = "experiments/training_report_v2_4_stories20k.md"
+V2_4_LOSS_CURVE_PATH = "experiments/loss_curve_v2_4_stories20k.png"
+V2_4_STORY_EVAL_JSON = "experiments/story_eval_v2_4_stories20k.json"
+V2_4_STORY_EVAL_REPORT = "experiments/story_eval_v2_4_stories20k.md"
+
+# v2.5 keeps v2.4's data and RoPE schedule. It widens the body and does not resume v2.4.
+V2_5_BEST_CHECKPOINT = "checkpoints/v2_5_width256_best.pt"
+V2_5_LATEST_CHECKPOINT = "checkpoints/v2_5_width256_latest.pt"
+V2_5_HISTORY_PATH = "experiments/training_history_v2_5_width256.json"
+V2_5_REPORT_PATH = "experiments/training_report_v2_5_width256.md"
+V2_5_LOSS_CURVE_PATH = "experiments/loss_curve_v2_5_width256.png"
+V2_5_STORY_EVAL_JSON = "experiments/story_eval_v2_5_width256.json"
+V2_5_STORY_EVAL_REPORT = "experiments/story_eval_v2_5_width256.md"
+
 TOKENIZER_COMPARISON_REPORT = "experiments/tokenizer_comparison.md"
 TOKENIZER_COMPARISON_JSON = "experiments/tokenizer_comparison.json"
 
 # "absolute" keeps the learned position table. "rope" rotates Q and K only.
 POSITION_ENCODING = "absolute"
 
-if TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_3_rope_ctx256":
+if TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_5_width256":
+    TOKENIZER_PATH = BPE_TOKENIZER_PATH
+    BLOCK_SIZE = V2_5_BLOCK_SIZE
+    BATCH_SIZE = V2_5_BATCH_SIZE
+    MAX_STEPS = V2_5_MAX_STEPS
+    NUM_TRAIN_STORIES = V2_5_TRAIN_STORIES
+    EMBEDDING_DIM = V2_5_EMBEDDING_DIM
+    NUM_HEADS = V2_5_NUM_HEADS
+    NUM_LAYERS = V2_5_NUM_LAYERS
+    POSITION_ENCODING = "rope"
+    RESUME_CHECKPOINT = None
+    BEST_CHECKPOINT = V2_5_BEST_CHECKPOINT
+    LATEST_CHECKPOINT = V2_5_LATEST_CHECKPOINT
+    HISTORY_PATH = V2_5_HISTORY_PATH
+    REPORT_PATH = V2_5_REPORT_PATH
+    LOSS_CURVE_PATH = V2_5_LOSS_CURVE_PATH
+    STORY_EVAL_JSON = V2_5_STORY_EVAL_JSON
+    STORY_EVAL_REPORT = V2_5_STORY_EVAL_REPORT
+elif TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_4_stories20k":
+    TOKENIZER_PATH = BPE_TOKENIZER_PATH
+    BLOCK_SIZE = V2_4_BLOCK_SIZE
+    BATCH_SIZE = V2_4_BATCH_SIZE
+    MAX_STEPS = V2_4_MAX_STEPS
+    NUM_TRAIN_STORIES = V2_4_TRAIN_STORIES
+    POSITION_ENCODING = "rope"
+    RESUME_CHECKPOINT = None
+    BEST_CHECKPOINT = V2_4_BEST_CHECKPOINT
+    LATEST_CHECKPOINT = V2_4_LATEST_CHECKPOINT
+    HISTORY_PATH = V2_4_HISTORY_PATH
+    REPORT_PATH = V2_4_REPORT_PATH
+    LOSS_CURVE_PATH = V2_4_LOSS_CURVE_PATH
+    STORY_EVAL_JSON = V2_4_STORY_EVAL_JSON
+    STORY_EVAL_REPORT = V2_4_STORY_EVAL_REPORT
+elif TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_3_rope_ctx256":
     TOKENIZER_PATH = BPE_TOKENIZER_PATH
     BLOCK_SIZE = V2_3_BLOCK_SIZE
     BATCH_SIZE = V2_3_BATCH_SIZE
@@ -196,7 +262,8 @@ elif TOKENIZER_TYPE == "char" and EXPERIMENT == "v1":
 else:
     raise ValueError(
         "Unsupported profile. Use EXPERIMENT 'v1', 'v2_bpe', 'v2_1_ctx256', "
-        "'v2_2_ctx256_longtrain', or 'v2_3_rope_ctx256'. "
+        "'v2_2_ctx256_longtrain', 'v2_3_rope_ctx256', 'v2_4_stories20k', or "
+        "'v2_5_width256'. "
         f"Got TOKENIZER_TYPE={TOKENIZER_TYPE!r}, EXPERIMENT={EXPERIMENT!r}."
     )
 
@@ -232,6 +299,10 @@ STORY_SCOREBOARD_V2_V21_V22_JSON = "experiments/story_scoreboard_v2_v2_1_v2_2.js
 STORY_SCOREBOARD_V2_V21_V22_REPORT = "experiments/story_scoreboard_v2_v2_1_v2_2.md"
 STORY_SCOREBOARD_V23_JSON = "experiments/story_scoreboard_v2_v2_1_v2_2_v2_3.json"
 STORY_SCOREBOARD_V23_REPORT = "experiments/story_scoreboard_v2_v2_1_v2_2_v2_3.md"
+STORY_SCOREBOARD_V24_JSON = "experiments/story_scoreboard_v2_v2_1_v2_2_v2_3_v2_4.json"
+STORY_SCOREBOARD_V24_REPORT = "experiments/story_scoreboard_v2_v2_1_v2_2_v2_3_v2_4.md"
+STORY_SCOREBOARD_V25_JSON = "experiments/story_scoreboard_v2_v2_1_v2_2_v2_3_v2_4_v2_5.json"
+STORY_SCOREBOARD_V25_REPORT = "experiments/story_scoreboard_v2_v2_1_v2_2_v2_3_v2_4_v2_5.md"
 CONTEXT_UTIL_V23_JSON = "experiments/context_utilization_v2_3.json"
 CONTEXT_UTIL_V23_REPORT = "experiments/context_utilization_v2_3.md"
 

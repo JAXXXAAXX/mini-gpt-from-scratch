@@ -140,6 +140,8 @@ def save_checkpoint(path: Path, model, optimizer, step: int, train_loss: float, 
                 "dropout": config.DROPOUT,
                 "learning_rate": config.LEARNING_RATE,
                 "training_steps": config.MAX_STEPS,
+                "train_stories": config.NUM_TRAIN_STORIES,
+                "valid_stories": config.NUM_VALID_STORIES,
             },
         },
         path,
@@ -444,7 +446,7 @@ Throughput counts only optimizer steps. Validation time is excluded. Tokens/sec 
 
 ## Limitations
 
-- The run uses a 5,000-story TinyStories slice.
+- The run uses a {result["train_stories"]:,}-story TinyStories training slice and {result["valid_stories"]:,} validation stories.
 - Perplexity summarizes next-token loss for the active tokenizer units.
 - A short run can still leave the validation loss far from a useful language model.
 - Block size {result["block_size"]} means different amounts of text for character vs BPE tokens.

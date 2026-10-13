@@ -1,8 +1,10 @@
 """Train MiniGPT for next-token prediction on TinyStories.
 
-Supports v1, v2, v2.1, and v2.2 via config.EXPERIMENT.
+Supports v1 through v2.5 via config.EXPERIMENT.
 BPE training never overwrites an existing BPE vocabulary.
 v2.2 resumes v2.1 and writes only to the v2.2 checkpoint paths.
+v2.4 trains a fresh RoPE model on 20,000 stories and does not overwrite v2.3.
+v2.5 widens that RoPE model and does not overwrite v2.4.
 """
 
 import sys
@@ -85,7 +87,26 @@ def main():
     print("Block size:", config.BLOCK_SIZE, "tokenizer units")
     print("Batch size:", config.BATCH_SIZE)
     print("Tokens per step:", config.BATCH_SIZE * config.BLOCK_SIZE)
-    if config.EXPERIMENT == "v2_2_ctx256_longtrain":
+    if config.EXPERIMENT == "v2_5_width256":
+        print(
+            "v2.5 keeps RoPE, context 256, batch 8, and the 20,000-story slice. "
+            f"Width changes to embedding {config.EMBEDDING_DIM}, "
+            f"{config.NUM_HEADS} heads, {config.NUM_LAYERS} layers. "
+            f"It trains from fresh weights for {config.MAX_STEPS} steps and does not resume v2.4."
+        )
+    elif config.EXPERIMENT == "v2_4_stories20k":
+        print(
+            "v2.4 keeps the v2.3 RoPE model, context 256, and batch 8. "
+            f"It trains from fresh weights on {config.NUM_TRAIN_STORIES} stories "
+            f"for {config.MAX_STEPS} steps. Validation stays "
+            f"{config.NUM_VALID_STORIES} stories. The existing BPE file is not refit."
+        )
+    elif config.EXPERIMENT == "v2_3_rope_ctx256":
+        print(
+            "v2.3 trains a fresh RoPE model for the same 3000-step budget as v2.2. "
+            "It does not resume v2.2."
+        )
+    elif config.EXPERIMENT == "v2_2_ctx256_longtrain":
         print(
             "v2.2 keeps context 256 and batch 8 (2048 tokens/step) and trains "
             f"through {config.MAX_STEPS} total steps."

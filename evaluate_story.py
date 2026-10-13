@@ -305,6 +305,12 @@ def experiment_label(name: str | None, tokenizer_type: str) -> str:
         return "v2.1 context 256"
     if name == "v2_2_ctx256_longtrain":
         return "v2.2 context 256"
+    if name == "v2_3_rope_ctx256":
+        return "v2.3 RoPE"
+    if name == "v2_4_stories20k":
+        return "v2.4 more stories"
+    if name == "v2_5_width256":
+        return "v2.5 wider"
     if name == "v2_bpe" or tokenizer_type == "bpe":
         return "v2 BPE"
     return "v1"
@@ -532,19 +538,21 @@ def continuation_length_stats(suite: list[dict]) -> dict:
         if item["stopping"]["stopped_naturally"]
     ]
     very_short = []
+    shortest = None
     for item in suite:
         if not item["stopping"]["stopped_naturally"]:
             continue
         tokens_before = int(item["stopping"]["tokens_appended"]) - 1
         continuation = sample_continuation(item)
+        candidate = {
+            "prompt": item.get("prompt", ""),
+            "continuation": continuation,
+            "tokens_before_eos": tokens_before,
+        }
+        if shortest is None or tokens_before < shortest["tokens_before_eos"]:
+            shortest = candidate
         if tokens_before <= 5 or len(continuation.strip()) <= 2:
-            very_short.append(
-                {
-                    "prompt": item.get("prompt", ""),
-                    "continuation": continuation,
-                    "tokens_before_eos": tokens_before,
-                }
-            )
+            very_short.append(candidate)
     return {
         "mean_continuation_tokens": mean_or_none(lengths),
         "median_continuation_tokens": _median(lengths),
@@ -555,6 +563,7 @@ def continuation_length_stats(suite: list[dict]) -> dict:
         "eos_sample_count": len(before_eos),
         "extremely_short_eos_count": len(very_short),
         "extremely_short_eos_examples": very_short,
+        "shortest_eos_example": shortest,
     }
 
 
@@ -678,6 +687,7 @@ def scoreboard_side(
         "max_continuation_tokens": metrics["max_continuation_tokens"],
         "extremely_short_eos_count": metrics["extremely_short_eos_count"],
         "extremely_short_eos_examples": metrics["extremely_short_eos_examples"],
+        "shortest_eos_example": metrics["shortest_eos_example"],
         "unrelated_name_introduction_rate": name_stats["unrelated_name_introduction_rate"],
         "unrelated_name_records": name_stats["records"],
         "characters_per_second": metrics["characters_per_second"],
@@ -1771,6 +1781,527 @@ def write_v23_scoreboard(
     print(report_path.as_posix())
 
 
+def v24_success(v23: dict, v24: dict) -> dict:
+    """v2.4 succeeds when the larger story slice keeps v2.3's loss and copies context better.
+
+    A higher EOS rate is not treated as an automatic improvement.
+    """
+    loss_gap = v24["validation_loss_context_64"] - v23["validation_loss_context_64"]
+    checks = {
+        "retention_above_v2_3": v24["long_prefix_retention_rate"] > v23["long_prefix_retention_rate"],
+        "shared_64_loss_gap_vs_v2_3": loss_gap,
+        "shared_64_loss_not_worse": loss_gap <= 0.05,
+        "unrelated_name_rate_below_v2_3": (
+            v24["unrelated_name_introduction_rate"] < v23["unrelated_name_introduction_rate"]
+        ),
+    }
+    checks["successful"] = bool(
+        checks["retention_above_v2_3"]
+        and checks["shared_64_loss_not_worse"]
+        and checks["unrelated_name_rate_below_v2_3"]
+    )
+    checks["strong"] = bool(
+        checks["successful"] and v24["validation_loss_context_64"] < v23["validation_loss_context_64"]
+    )
+    return checks
+
+
+def _short_continuation_line(label: str, side: dict) -> str:
+    examples = side.get("extremely_short_eos_examples") or []
+    shortest = side.get("shortest_eos_example")
+    if examples:
+        shown = examples[0]
+        return (
+            f"- {label}: {side.get('extremely_short_eos_count')} extremely short EOS "
+            f"continuation(s). One of them follows `{shown['prompt']}` with "
+            f"`{shown['continuation']}` ({shown['tokens_before_eos']} tokens before EOS)."
+        )
+    if shortest:
+        return (
+            f"- {label}: no continuation stops within 5 tokens. The shortest EOS "
+            f"continuation follows `{shortest['prompt']}` with "
+            f"`{shortest['continuation']}` ({shortest['tokens_before_eos']} tokens before EOS)."
+        )
+    return f"- {label}: no EOS continuation in the short suite."
+
+
+def build_v24_scoreboard(
+    labeled_sides: list[tuple[str, dict]],
+    stories: list[dict],
+    success: dict,
+) -> str:
+    sides = [side for _label, side in labeled_sides]
+    headers = " | ".join(label for label, _side in labeled_sides)
+
+    def row(label: str, key: str, digits: int = 4) -> str:
+        cells = " | ".join(fmt(side.get(key), digits) for side in sides)
+        return f"| {label} | {cells} |"
+
+    story_blocks = []
+    for story in stories:
+        lines = [
+            f"### Validation story {story['story_index']}",
+            "",
+            "Prefix:",
+            "",
+            "```text",
+            story["prefix_text"],
+            "```",
+            "",
+        ]
+        for item in story["continuations"]:
+            checks = item["checks"]
+            mention_lines = "\n".join(
+                f"- exact mention {entity}: {'yes' if entity in checks['exact_mentions'] else 'no'}"
+                for entity in checks.get("expected_entities", [])
+            )
+            short_note = ""
+            if item.get("extremely_short"):
+                short_note = (
+                    f"- extremely short continuation: yes "
+                    f"({item.get('tokens_before_eos')} tokens before EOS)\n"
+                )
+            lines.extend(
+                [
+                    f"#### {item['label']}",
+                    "",
+                    "```text",
+                    item["continuation_text"],
+                    "```",
+                    "",
+                    f"- expected entities: {', '.join(checks.get('expected_entities') or []) or 'none'}",
+                    mention_lines or "- no expected entities",
+                    f"- new named entities: {', '.join(checks.get('new_named_entities') or []) or 'none'}",
+                    "- unrelated new protagonist: "
+                    + ("yes" if checks.get("unrelated_new_protagonist") else "no"),
+                    f"- produced EOS: {'yes' if checks.get('eos') else 'no'}",
+                    short_note.rstrip(),
+                    "",
+                ]
+            )
+        story_blocks.append("\n".join(lines))
+
+    short_lines = [
+        _short_continuation_line(label, side) for label, side in labeled_sides
+    ]
+    if success["strong"]:
+        verdict = (
+            "v2.4 meets the strong result: long-prefix retention is above v2.3, "
+            "shared 64-token loss is lower than v2.3, and the unrelated-name "
+            "introduction rate is lower than v2.3."
+        )
+    elif success["successful"]:
+        verdict = (
+            "v2.4 meets the main checks: retention is above v2.3, shared 64-token loss "
+            "is no more than 0.05 higher than v2.3, and fewer long-prefix stories "
+            "introduce an unrelated name. Shared loss is not lower than v2.3."
+        )
+    else:
+        verdict = (
+            "v2.4 does not meet the main checks. "
+            f"Retention above v2.3: {success['retention_above_v2_3']}. "
+            f"Shared 64-token loss gap versus v2.3: {success['shared_64_loss_gap_vs_v2_3']:.4f} "
+            "(not worse means no more than 0.05 higher). "
+            f"Unrelated-name rate below v2.3: {success['unrelated_name_rate_below_v2_3']}."
+        )
+    position_cells = " | ".join(
+        str(side.get("position_encoding", "absolute")) for side in sides
+    )
+    return f"""# Story scoreboard: v2 vs v2.1 vs v2.2 vs v2.3 vs v2.4
+
+v2, v2.1, and v2.2 use learned absolute positions and 5,000 training stories. v2.3 uses RoPE, the same width, and the same 5,000 stories. v2.4 uses that same RoPE model, the same BPE file, the same 500 validation stories, and the same decoding. It trains from fresh weights on 20,000 stories for 12,000 steps, four times the v2.3 step budget, so the number of passes stays near v2.3.
+
+Shared 64-token loss and native-context loss stay in separate rows. Perplexity is exp(loss) on the same split. Long-prefix retention uses the existing 128-token probe and the same early terms. A higher EOS stop rate is listed, and the token counts show whether those stops are short.
+
+| Metric | {headers} |
+|{"|".join(["---"] + ["---:"] * len(sides))}|
+{row("Training stories", "train_stories", 0)}
+{row("Checkpoint step", "checkpoint_step", 0)}
+{row("Shared 64-token validation loss", "validation_loss_context_64")}
+{row("Native-context validation loss", "validation_loss")}
+{row("Shared perplexity", "shared_64_perplexity", 2)}
+{row("Native perplexity", "native_perplexity", 2)}
+{row("Long-prefix retention", "long_prefix_retention_rate", 3)}
+{row("Distinct-2", "short_suite_distinct_2", 3)}
+{row("Distinct-3", "short_suite_distinct_3", 3)}
+{row("Repeated 3-gram rate", "short_suite_repeated_3gram_rate", 3)}
+{row("EOS stop rate", "eos_stop_rate", 3)}
+{row("Avg tokens before EOS", "avg_tokens_before_eos", 1)}
+{row("Median tokens before EOS", "median_tokens_before_eos", 1)}
+{row("Mean continuation tokens", "mean_continuation_tokens", 1)}
+{row("Median continuation tokens", "median_continuation_tokens", 1)}
+{row("Min continuation tokens", "min_continuation_tokens", 0)}
+{row("Max continuation tokens", "max_continuation_tokens", 0)}
+{row("Unrelated-name introduction rate", "unrelated_name_introduction_rate", 3)}
+{row("Characters/sec", "characters_per_second", 1)}
+{row("Peak GPU memory (MB)", "peak_gpu_memory_mb", 1)}
+| Position encoding | {position_cells} |
+
+## Short continuations
+
+An EOS stop with only a few tokens still counts in the EOS rate. These lines quote the short suite when that happens.
+
+{chr(10).join(short_lines)}
+
+## Real validation prefixes
+
+Expected entities are names and two-word spans copied from the prefix. A mention counts only when that same string appears in the continuation. A new capitalized name that was not in the prefix is recorded as a new named entity. The check does not decide that a common noun is the same character.
+
+{chr(10).join(story_blocks)}
+
+## v2.4 checks
+
+{verdict}
+"""
+
+
+def v25_success(v24: dict, v25: dict) -> dict:
+    """v2.5 succeeds when the wider model copies long prefixes better without losing loss.
+
+    A higher EOS rate is not treated as an automatic improvement.
+    """
+    loss_gap = v25["validation_loss_context_64"] - v24["validation_loss_context_64"]
+    repetition_gap = (
+        v25["short_suite_repeated_3gram_rate"] - v24["short_suite_repeated_3gram_rate"]
+    )
+    checks = {
+        "retention_above_v2_4": v25["long_prefix_retention_rate"] > v24["long_prefix_retention_rate"],
+        "shared_64_loss_gap_vs_v2_4": loss_gap,
+        "shared_64_loss_not_worse": loss_gap <= 0.05,
+        "repetition_not_worse": repetition_gap <= 0.01,
+        "unrelated_name_rate_not_worse": (
+            v25["unrelated_name_introduction_rate"] <= v24["unrelated_name_introduction_rate"]
+        ),
+    }
+    checks["successful"] = bool(
+        checks["retention_above_v2_4"]
+        and checks["shared_64_loss_not_worse"]
+        and checks["repetition_not_worse"]
+    )
+    checks["strong"] = bool(
+        checks["successful"]
+        and checks["unrelated_name_rate_not_worse"]
+        and v25["validation_loss_context_64"] < v24["validation_loss_context_64"]
+    )
+    return checks
+
+
+def build_v25_scoreboard(
+    labeled_sides: list[tuple[str, dict]],
+    stories: list[dict],
+    success: dict,
+) -> str:
+    sides = [side for _label, side in labeled_sides]
+    headers = " | ".join(label for label, _side in labeled_sides)
+
+    def row(label: str, key: str, digits: int = 4) -> str:
+        cells = " | ".join(fmt(side.get(key), digits) for side in sides)
+        return f"| {label} | {cells} |"
+
+    story_blocks = []
+    for story in stories:
+        lines = [
+            f"### Validation story {story['story_index']}",
+            "",
+            "Prefix:",
+            "",
+            "```text",
+            story["prefix_text"],
+            "```",
+            "",
+        ]
+        for item in story["continuations"]:
+            checks = item["checks"]
+            mention_lines = "\n".join(
+                f"- exact mention {entity}: {'yes' if entity in checks['exact_mentions'] else 'no'}"
+                for entity in checks.get("expected_entities", [])
+            )
+            short_note = ""
+            if item.get("extremely_short"):
+                short_note = (
+                    f"- extremely short continuation: yes "
+                    f"({item.get('tokens_before_eos')} tokens before EOS)\n"
+                )
+            lines.extend(
+                [
+                    f"#### {item['label']}",
+                    "",
+                    "```text",
+                    item["continuation_text"],
+                    "```",
+                    "",
+                    f"- expected entities: {', '.join(checks.get('expected_entities') or []) or 'none'}",
+                    mention_lines or "- no expected entities",
+                    f"- new named entities: {', '.join(checks.get('new_named_entities') or []) or 'none'}",
+                    "- unrelated new protagonist: "
+                    + ("yes" if checks.get("unrelated_new_protagonist") else "no"),
+                    f"- produced EOS: {'yes' if checks.get('eos') else 'no'}",
+                    short_note.rstrip(),
+                    "",
+                ]
+            )
+        story_blocks.append("\n".join(lines))
+
+    short_lines = [
+        _short_continuation_line(label, side) for label, side in labeled_sides
+    ]
+    if success["strong"]:
+        verdict = (
+            "v2.5 meets the strong result: long-prefix retention is above v2.4, "
+            "shared 64-token loss is lower than v2.4, repeated 3-gram rate is not worse, "
+            "and the unrelated-name introduction rate is not worse."
+        )
+    elif success["successful"]:
+        verdict = (
+            "v2.5 meets the main checks: retention is above v2.4, shared 64-token loss "
+            "is no more than 0.05 higher than v2.4, and short-suite repetition is not "
+            "materially worse. This is not the strong result."
+        )
+    else:
+        verdict = (
+            "v2.5 does not meet the main checks. "
+            f"Retention above v2.4: {success['retention_above_v2_4']}. "
+            f"Shared 64-token loss gap versus v2.4: {success['shared_64_loss_gap_vs_v2_4']:.4f} "
+            "(not worse means no more than 0.05 higher). "
+            f"Repetition not worse: {success['repetition_not_worse']}. "
+            f"Unrelated-name rate not worse: {success['unrelated_name_rate_not_worse']}."
+        )
+    position_cells = " | ".join(
+        str(side.get("position_encoding", "absolute")) for side in sides
+    )
+    width_cells = " | ".join(
+        f"{side.get('embedding_dim', 'n/a')}/{side.get('num_heads', 'n/a')}/{side.get('num_layers', 'n/a')}"
+        for side in sides
+    )
+    return f"""# Story scoreboard: v2 vs v2.1 vs v2.2 vs v2.3 vs v2.4 vs v2.5
+
+v2 through v2.4 keep embedding 128, 4 heads, and 4 layers. v2.5 keeps RoPE, the 20,000-story slice, context 256, batch 8, 12,000 steps, the same BPE file, and the same decoding. It only widens the body to embedding 256 and 8 heads, and trains from fresh weights.
+
+Shared 64-token loss and native-context loss stay in separate rows. Perplexity is exp(loss) on the same split. Long-prefix retention uses the existing 128-token probe and the same early terms. A higher EOS stop rate is listed, and the token counts show whether those stops are short.
+
+| Metric | {headers} |
+|{"|".join(["---"] + ["---:"] * len(sides))}|
+{row("Training stories", "train_stories", 0)}
+{row("Checkpoint step", "checkpoint_step", 0)}
+{row("Parameters", "parameter_count", 0)}
+| Width (emb/heads/layers) | {width_cells} |
+{row("Shared 64-token validation loss", "validation_loss_context_64")}
+{row("Native-context validation loss", "validation_loss")}
+{row("Shared perplexity", "shared_64_perplexity", 2)}
+{row("Native perplexity", "native_perplexity", 2)}
+{row("Long-prefix retention", "long_prefix_retention_rate", 3)}
+{row("Distinct-2", "short_suite_distinct_2", 3)}
+{row("Distinct-3", "short_suite_distinct_3", 3)}
+{row("Repeated 3-gram rate", "short_suite_repeated_3gram_rate", 3)}
+{row("EOS stop rate", "eos_stop_rate", 3)}
+{row("Avg tokens before EOS", "avg_tokens_before_eos", 1)}
+{row("Median tokens before EOS", "median_tokens_before_eos", 1)}
+{row("Mean continuation tokens", "mean_continuation_tokens", 1)}
+{row("Median continuation tokens", "median_continuation_tokens", 1)}
+{row("Min continuation tokens", "min_continuation_tokens", 0)}
+{row("Max continuation tokens", "max_continuation_tokens", 0)}
+{row("Unrelated-name introduction rate", "unrelated_name_introduction_rate", 3)}
+{row("Characters/sec", "characters_per_second", 1)}
+{row("Peak GPU memory (MB)", "peak_gpu_memory_mb", 1)}
+| Position encoding | {position_cells} |
+
+## Short continuations
+
+An EOS stop with only a few tokens still counts in the EOS rate. These lines quote the short suite when that happens.
+
+{chr(10).join(short_lines)}
+
+## Real validation prefixes
+
+Expected entities are names and two-word spans copied from the prefix. A mention counts only when that same string appears in the continuation. A new capitalized name that was not in the prefix is recorded as a new named entity. The check does not decide that a common noun is the same character.
+
+{chr(10).join(story_blocks)}
+
+## v2.5 checks
+
+{verdict}
+"""
+
+
+def write_v25_scoreboard(
+    active_model,
+    active_checkpoint_step: int | None,
+    tokenizer,
+    valid_ids: list[int],
+    valid_stories: list[str],
+    memory_items: list[dict],
+    gen_cfg: dict,
+    device: torch.device,
+    suite: list[dict],
+    probe: dict,
+    native: dict,
+    matched_64: dict,
+) -> None:
+    v25 = collect_scoreboard_model(
+        "v2_5_width256",
+        config.V2_5_BEST_CHECKPOINT,
+        active_model,
+        valid_ids,
+        memory_items,
+        gen_cfg,
+        device,
+        tokenizer,
+        suite=suite,
+        probe=probe,
+        native=native,
+        matched_64=matched_64,
+    )
+    v25["checkpoint_step"] = active_checkpoint_step
+    v25["train_stories"] = config.V2_5_TRAIN_STORIES
+    v25["embedding_dim"] = getattr(active_model, "embedding_dim", config.EMBEDDING_DIM)
+    v25["num_heads"] = getattr(active_model, "num_heads", config.NUM_HEADS)
+    v25["num_layers"] = getattr(active_model, "num_layers", config.NUM_LAYERS)
+    loaded = [
+        ("v2", config.V2_BPE_BEST_CHECKPOINT, "v2_bpe", 5000, 128, 4, 4),
+        ("v2.1", config.V2_1_CTX256_BEST_CHECKPOINT, "v2_1_ctx256", 5000, 128, 4, 4),
+        ("v2.2", config.V2_2_CTX256_BEST_CHECKPOINT, "v2_2_ctx256_longtrain", 5000, 128, 4, 4),
+        ("v2.3", config.V2_3_ROPE_BEST_CHECKPOINT, "v2_3_rope_ctx256", 5000, 128, 4, 4),
+        ("v2.4", config.V2_4_BEST_CHECKPOINT, "v2_4_stories20k", 20000, 128, 4, 4),
+    ]
+    sides = {"v2.5": v25}
+    models = [("v2.5", active_model)]
+    for label, path, experiment, train_stories, emb, heads, layers in loaded:
+        if not Path(path).exists():
+            raise FileNotFoundError(f"Missing {path}. The v2.5 scoreboard does not train earlier models.")
+        print(f"Scoring {label} from {path}")
+        model, checkpoint = load_model(path, device)
+        side = collect_scoreboard_model(
+            experiment,
+            path,
+            model,
+            valid_ids,
+            memory_items,
+            gen_cfg,
+            device,
+            tokenizer,
+        )
+        side["checkpoint_step"] = checkpoint.get("step")
+        side["train_stories"] = checkpoint.get("model_config", {}).get("train_stories", train_stories)
+        model_cfg = checkpoint.get("model_config", {})
+        side["embedding_dim"] = model_cfg.get("embedding_dim", emb)
+        side["num_heads"] = model_cfg.get("num_heads", heads)
+        side["num_layers"] = model_cfg.get("num_layers", layers)
+        sides[label] = side
+        models.append((label, model))
+    ordered = [
+        item
+        for label in ("v2", "v2.1", "v2.2", "v2.3", "v2.4", "v2.5")
+        for item in models
+        if item[0] == label
+    ]
+    print("Generating shared validation-prefix comparisons...")
+    stories = compare_real_prefixes(ordered, tokenizer, valid_stories, device)
+    success = v25_success(sides["v2.4"], sides["v2.5"])
+    labeled = [(label, sides[label]) for label in ("v2", "v2.1", "v2.2", "v2.3", "v2.4", "v2.5")]
+    payload = {
+        "v2": sides["v2"],
+        "v2_1": sides["v2.1"],
+        "v2_2": sides["v2.2"],
+        "v2_3": sides["v2.3"],
+        "v2_4": sides["v2.4"],
+        "v2_5": sides["v2.5"],
+        "stories": stories,
+        "success": success,
+    }
+    json_path = Path(config.STORY_SCOREBOARD_V25_JSON)
+    report_path = Path(config.STORY_SCOREBOARD_V25_REPORT)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    report_path.write_text(build_v25_scoreboard(labeled, stories, success), encoding="utf-8")
+    print("Saved v2.5 scoreboard:")
+    print(report_path.as_posix())
+
+
+def write_v24_scoreboard(
+    active_model,
+    active_checkpoint_step: int | None,
+    tokenizer,
+    valid_ids: list[int],
+    valid_stories: list[str],
+    memory_items: list[dict],
+    gen_cfg: dict,
+    device: torch.device,
+    suite: list[dict],
+    probe: dict,
+    native: dict,
+    matched_64: dict,
+) -> None:
+    v24 = collect_scoreboard_model(
+        "v2_4_stories20k",
+        config.V2_4_BEST_CHECKPOINT,
+        active_model,
+        valid_ids,
+        memory_items,
+        gen_cfg,
+        device,
+        tokenizer,
+        suite=suite,
+        probe=probe,
+        native=native,
+        matched_64=matched_64,
+    )
+    v24["checkpoint_step"] = active_checkpoint_step
+    v24["train_stories"] = config.V2_4_TRAIN_STORIES
+    loaded = [
+        ("v2", config.V2_BPE_BEST_CHECKPOINT, "v2_bpe", 5000),
+        ("v2.1", config.V2_1_CTX256_BEST_CHECKPOINT, "v2_1_ctx256", 5000),
+        ("v2.2", config.V2_2_CTX256_BEST_CHECKPOINT, "v2_2_ctx256_longtrain", 5000),
+        ("v2.3", config.V2_3_ROPE_BEST_CHECKPOINT, "v2_3_rope_ctx256", 5000),
+    ]
+    sides = {"v2.4": v24}
+    models = [("v2.4", active_model)]
+    for label, path, experiment, train_stories in loaded:
+        if not Path(path).exists():
+            raise FileNotFoundError(f"Missing {path}. The v2.4 scoreboard does not train earlier models.")
+        print(f"Scoring {label} from {path}")
+        model, checkpoint = load_model(path, device)
+        side = collect_scoreboard_model(
+            experiment,
+            path,
+            model,
+            valid_ids,
+            memory_items,
+            gen_cfg,
+            device,
+            tokenizer,
+        )
+        side["checkpoint_step"] = checkpoint.get("step")
+        side["train_stories"] = checkpoint.get("model_config", {}).get("train_stories", train_stories)
+        sides[label] = side
+        models.append((label, model))
+    ordered = [
+        item
+        for label in ("v2", "v2.1", "v2.2", "v2.3", "v2.4")
+        for item in models
+        if item[0] == label
+    ]
+    print("Generating shared validation-prefix comparisons...")
+    stories = compare_real_prefixes(ordered, tokenizer, valid_stories, device)
+    success = v24_success(sides["v2.3"], sides["v2.4"])
+    labeled = [(label, sides[label]) for label in ("v2", "v2.1", "v2.2", "v2.3", "v2.4")]
+    payload = {
+        "v2": sides["v2"],
+        "v2_1": sides["v2.1"],
+        "v2_2": sides["v2.2"],
+        "v2_3": sides["v2.3"],
+        "v2_4": sides["v2.4"],
+        "stories": stories,
+        "success": success,
+    }
+    json_path = Path(config.STORY_SCOREBOARD_V24_JSON)
+    report_path = Path(config.STORY_SCOREBOARD_V24_REPORT)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    report_path.write_text(build_v24_scoreboard(labeled, stories, success), encoding="utf-8")
+    print("Saved v2.4 scoreboard:")
+    print(report_path.as_posix())
+
+
 def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer_type = resolve_tokenizer_type()
@@ -2098,6 +2629,38 @@ def main() -> None:
             )
             print("Saved story scoreboard:")
             print(scoreboard_report.as_posix())
+
+    if config.EXPERIMENT == "v2_5_width256" and long_prefix_probe is not None:
+        write_v25_scoreboard(
+            model,
+            checkpoint.get("step"),
+            tokenizer,
+            valid_ids,
+            valid_stories,
+            memory_items,
+            gen_cfg,
+            device,
+            story_suite,
+            long_prefix_probe,
+            native_validation,
+            validation_context_64,
+        )
+
+    if config.EXPERIMENT == "v2_4_stories20k" and long_prefix_probe is not None:
+        write_v24_scoreboard(
+            model,
+            checkpoint.get("step"),
+            tokenizer,
+            valid_ids,
+            valid_stories,
+            memory_items,
+            gen_cfg,
+            device,
+            story_suite,
+            long_prefix_probe,
+            native_validation,
+            validation_context_64,
+        )
 
     if config.EXPERIMENT == "v2_3_rope_ctx256" and long_prefix_probe is not None:
         write_v23_scoreboard(
