@@ -65,17 +65,25 @@ def evaluate(model: MiniGPT, loader, device: torch.device, max_batches: int, ste
     return total / count
 
 
-def train_one_step(model, optimizer, inputs, targets, grad_clip: float, step: int) -> float:
-    """One AdamW update on a single next-token batch."""
+def train_one_step(model, optimizer, inputs, targets, grad_clip: float, step: int) -> tuple[float, float]:
+    """One AdamW update. Returns the loss and the pre-clip gradient norm."""
     model.train()
     optimizer.zero_grad(set_to_none=True)
     loss = language_model_loss(model(inputs), targets)
     value = _finite(loss, step, "Train")
     loss.backward()
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        if not torch.isfinite(parameter.grad).all():
+            raise RuntimeError(f"Non-finite gradient in {name} at step {step}.")
     # Clip the global gradient norm so one spike cannot take a huge step.
-    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    # The returned value is the total norm before clipping.
+    grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip))
+    if not math.isfinite(grad_norm):
+        raise RuntimeError(f"Gradient norm became non-finite at step {step}: {grad_norm}")
     optimizer.step()
-    return value
+    return value, grad_norm
 
 
 def _sync(device: torch.device) -> None:
@@ -105,7 +113,7 @@ def overfit_one_batch(model, optimizer, batch, device: torch.device, steps: int,
     model.train()
     losses = [initial]
     for step in range(1, steps + 1):
-        losses.append(train_one_step(model, optimizer, inputs, targets, grad_clip, step))
+        losses.append(train_one_step(model, optimizer, inputs, targets, grad_clip, step)[0])
     return losses
 
 
@@ -119,13 +127,19 @@ def save_checkpoint(path: Path, model, optimizer, step: int, train_loss: float, 
             "train_loss": train_loss,
             "validation_loss": validation_loss,
             "model_config": {
+                "version": config.EXPERIMENT,
+                "experiment": config.EXPERIMENT,
                 "tokenizer_type": config.TOKENIZER_TYPE,
+                "position_encoding": getattr(model, "position_encoding", "absolute"),
                 "vocab_size": model.vocab_size,
                 "block_size": model.block_size,
+                "batch_size": config.BATCH_SIZE,
                 "embedding_dim": model.embedding_dim,
                 "num_heads": model.num_heads,
                 "num_layers": model.num_layers,
                 "dropout": config.DROPOUT,
+                "learning_rate": config.LEARNING_RATE,
+                "training_steps": config.MAX_STEPS,
             },
         },
         path,
@@ -150,10 +164,11 @@ def train_steps(
     best_checkpoint_path: str | None = None,
     latest_checkpoint_path: str | None = None,
     characters_per_token: float | None = None,
+    initial_history: list[dict] | None = None,
 ) -> dict:
     """Train for config.MAX_STEPS and record loss at each eval interval."""
     model.train()
-    history = []
+    history = list(initial_history or [])
     train_iterator = iter(train_loader)
     train_seconds = 0.0
     train_tokens = 0
@@ -164,7 +179,13 @@ def train_steps(
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    def record(step: int, train_loss: float, validation_loss: float) -> None:
+    def record(
+        step: int,
+        train_loss: float,
+        validation_loss: float,
+        mean_grad_norm: float | None = None,
+        max_grad_norm: float | None = None,
+    ) -> None:
         nonlocal best_loss
         elapsed = time.perf_counter() - started
         history.append(
@@ -172,12 +193,17 @@ def train_steps(
                 "step": step,
                 "train_loss": train_loss,
                 "validation_loss": validation_loss,
+                "validation_perplexity": perplexity(validation_loss),
+                "mean_grad_norm": mean_grad_norm,
+                "max_grad_norm": max_grad_norm,
                 "elapsed_seconds": elapsed,
             }
         )
+        grad_text = "n/a" if mean_grad_norm is None else f"{mean_grad_norm:.4f}"
         print(f"Step {step}")
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Validation Loss: {validation_loss:.4f}")
+        print(f"Mean Grad Norm: {grad_text}")
         print()
         save_checkpoint(
             latest_path,
@@ -211,21 +237,35 @@ def train_steps(
         record(0, initial_loss, evaluate(model, valid_loader, device, config.EVAL_BATCHES, 0))
 
     recent_losses = []
+    recent_grads = []
     for step in range(start_step + 1, config.MAX_STEPS + 1):
         (inputs, targets), train_iterator = next_batch(train_loader, train_iterator)
         inputs = inputs.to(device)
         targets = targets.to(device)
         _sync(device)
         step_started = time.perf_counter()
-        recent_losses.append(train_one_step(model, optimizer, inputs, targets, config.GRAD_CLIP, step))
+        step_loss, step_grad = train_one_step(
+            model, optimizer, inputs, targets, config.GRAD_CLIP, step
+        )
+        recent_losses.append(step_loss)
+        recent_grads.append(step_grad)
         _sync(device)
         train_seconds += time.perf_counter() - step_started
         train_tokens += inputs.shape[0] * inputs.shape[1]
 
         if step % config.EVAL_INTERVAL == 0 or step == config.MAX_STEPS:
             train_loss = sum(recent_losses) / len(recent_losses)
+            mean_grad = sum(recent_grads) / len(recent_grads)
+            max_grad = max(recent_grads)
             recent_losses.clear()
-            record(step, train_loss, evaluate(model, valid_loader, device, config.EVAL_BATCHES, step))
+            recent_grads.clear()
+            record(
+                step,
+                train_loss,
+                evaluate(model, valid_loader, device, config.EVAL_BATCHES, step),
+                mean_grad,
+                max_grad,
+            )
 
     peak_mb = None
     if device.type == "cuda":
@@ -267,13 +307,53 @@ def save_loss_curve(history: list[dict], path: Path) -> None:
 def generate_training_report(result: dict) -> str:
     """Build the Markdown report from the saved training result dictionary."""
     history = result["history"]
+    def grad_cell(item: dict) -> str:
+        value = item.get("mean_grad_norm")
+        if value is None:
+            return "n/a"
+        return f"{value:.4f}"
+
     rows = "\n".join(
         f"| {item['step']} | {item['train_loss']:.4f} | {item['validation_loss']:.4f} | "
+        f"{perplexity(item['validation_loss']):.2f} | {grad_cell(item)} | "
         f"{item['elapsed_seconds']:.1f} s |"
         for item in history
     )
+    curve_name = Path(result.get("loss_curve_path") or config.LOSS_CURVE_PATH).name
+    tokens_per_step = result["batch_size"] * result["block_size"]
+    exposure = tokens_per_step * result["max_steps"]
+    resume = result.get("resume") or {}
+    if resume.get("resumed"):
+        resume_section = f"""## Resume
+
+This run {resume.get("mode")}.
+
+- Source checkpoint: `{resume.get("from_checkpoint")}`
+- Resumed step: {resume.get("from_step")}
+- Target total steps: {resume.get("target_total_steps")}
+- Additional optimizer steps: {resume.get("additional_steps")}
+- Resumed validation loss: {resume.get("resumed_validation_loss")}
+
+{resume.get("note", "")}
+
+The logged validation loss is the {result["eval_batches"]}-batch estimate used to pick the best checkpoint. The story scoreboard measures the full validation split separately.
+"""
+    else:
+        resume_section = ""
     first = history[0]
     last = history[-1]
+    step_1000 = next((item for item in history if item["step"] == 1000), None)
+    if step_1000 is None:
+        curve_reading = "The history does not contain a step-1000 validation point."
+    else:
+        gained = step_1000["validation_loss"] - result["best_validation_loss"]
+        curve_reading = (
+            f"Validation loss at step 1000 is {step_1000['validation_loss']:.4f}. "
+            f"The best logged validation loss is {result['best_validation_loss']:.4f} "
+            f"at step {result['best_step']}. "
+            f"The final logged validation loss is {last['validation_loss']:.4f} at step {last['step']}. "
+            f"The best point is {gained:.4f} lower than step 1000."
+        )
     memory = (
         "unavailable"
         if result["peak_gpu_memory_mb"] is None
@@ -297,6 +377,7 @@ def generate_training_report(result: dict) -> str:
 - Device: `{result["device"]}`
 - GPU name: {gpu_name}
 - Tokenizer type: {result.get("tokenizer_type", "char")}
+- Position encoding: {result.get("position_encoding", "absolute")}
 - Vocabulary size: {result["vocab_size"]}
 - Block size: {result["block_size"]} tokenizer units
 - Embedding dimension: {result["embedding_dim"]}
@@ -320,19 +401,25 @@ def generate_training_report(result: dict) -> str:
 - Validation stories: {result["valid_stories"]:,}
 - Training tokens: {result["train_tokens"]:,}
 - Validation tokens: {result["valid_tokens"]:,}
-- Targets per batch: {result["batch_size"] * result["block_size"]:,}
+- Targets per batch: {tokens_per_step:,}
+- Planned target tokens over the full step budget: {exposure:,}
 
+{resume_section}
 ## Training Setup
 
-AdamW updates the model on next-token cross-entropy. Each logged train loss is the average of the training steps since the previous log. Validation loss is the average over {result["eval_batches"]} validation batches, with gradients disabled. Checkpoints are `{result.get("latest_checkpoint_path", config.LATEST_CHECKPOINT)}` and `{result.get("best_checkpoint_path", config.BEST_CHECKPOINT)}`.
+AdamW updates the model on next-token cross-entropy. Each logged train loss is the average of the training steps since the previous log. Validation loss is the average over {result["eval_batches"]} validation batches, with gradients disabled. Checkpoints are `{result.get("latest_checkpoint_path", config.LATEST_CHECKPOINT)}` and `{result.get("best_checkpoint_path", config.BEST_CHECKPOINT)}`. The best checkpoint is the lowest logged validation loss, which can be earlier than the final step.
 
 ## Loss Progress
 
-![Loss curve](loss_curve.png)
+![Loss curve]({curve_name})
 
-| Step | Train Loss | Validation Loss | Elapsed Time |
-|---:|---:|---:|---:|
+| Step | Train Loss | Validation Loss | Perplexity | Mean Grad Norm | Elapsed Time |
+|---:|---:|---:|---:|---:|---:|
 {rows}
+
+## Validation Curve
+
+{curve_reading}
 
 ## Best Validation Result
 
@@ -340,7 +427,7 @@ AdamW updates the model on next-token cross-entropy. Each logged train loss is t
 - Validation loss: {result["best_validation_loss"]:.4f}
 - Validation perplexity: {result["best_validation_perplexity"]:.2f}
 
-Perplexity is `exp(validation loss)`. A lower value means the model assigns more probability to the actual next characters. It is not a complete measure of story quality.
+Perplexity is `exp(validation loss)`. A lower value means the model assigns more probability to the actual next tokens. It is not a complete measure of story quality.
 
 ## Computational Performance
 

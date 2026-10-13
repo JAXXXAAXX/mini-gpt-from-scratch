@@ -77,6 +77,7 @@ def parameter_breakdown(
     num_heads: int = config.NUM_HEADS,
     num_layers: int = config.NUM_LAYERS,
     dropout: float = config.DROPOUT,
+    position_encoding: str = config.POSITION_ENCODING,
 ) -> dict[str, Any]:
     """Instantiate MiniGPT on CPU and break out major parameter groups."""
     model = MiniGPT(
@@ -86,9 +87,13 @@ def parameter_breakdown(
         num_heads=num_heads,
         num_layers=num_layers,
         dropout=dropout,
+        position_encoding=position_encoding,
     )
     token_embedding = sum(p.numel() for p in model.token_embedding.parameters())
-    position_embedding = sum(p.numel() for p in model.position_embedding.parameters())
+    if model.position_embedding is None:
+        position_embedding = 0
+    else:
+        position_embedding = sum(p.numel() for p in model.position_embedding.parameters())
     lm_head = sum(p.numel() for p in model.lm_head.parameters())
     transformer = sum(p.numel() for p in model.blocks.parameters()) + sum(
         p.numel() for p in model.final_ln.parameters()

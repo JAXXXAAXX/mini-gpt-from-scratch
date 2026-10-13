@@ -464,6 +464,7 @@ def main() -> None:
         num_heads=model_config["num_heads"],
         num_layers=model_config["num_layers"],
         dropout=model_config["dropout"],
+        position_encoding=model_config.get("position_encoding", "absolute"),
     ).to(device)
     untrained_loss, _ = average_validation_loss(
         untrained, valid_loader, device, config.EVAL_MAX_BATCHES

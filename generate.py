@@ -57,6 +57,7 @@ def load_model(checkpoint_path: str, device: torch.device) -> tuple[MiniGPT, dic
         num_heads=model_config["num_heads"],
         num_layers=model_config["num_layers"],
         dropout=model_config["dropout"],
+        position_encoding=model_config.get("position_encoding", "absolute"),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -139,6 +140,79 @@ def generate_once(
         "tokens_per_second": tokens_generated / elapsed if elapsed > 0 else 0.0,
         "characters_generated": max(chars_generated, 0),
         "characters_per_second": max(chars_generated, 0) / elapsed if elapsed > 0 else 0.0,
+        "peak_gpu_memory_mb": peak_mb,
+        "stopped_on_eos": stopped_on_eos,
+        "eos_supported": stop_id is not None,
+    }
+
+
+def generate_from_ids(
+    model: MiniGPT,
+    tokenizer,
+    prompt_ids: list[int],
+    prompt_text: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int | None,
+    seed: int | None,
+    device: torch.device,
+    stop_on_eos: bool = True,
+) -> dict:
+    """Sample a continuation from exact token ids.
+
+    Decoding the prefix and encoding it again can change BPE boundaries.
+    Callers that need a fixed token prefix, such as the long-context probe,
+    should pass those ids here. The returned text is prompt_text plus the
+    decoded new tokens, so continuation metrics can slice on prompt_text.
+    """
+    if not prompt_ids:
+        raise ValueError("prompt_ids must contain at least one token.")
+    set_seed(seed, device)
+    prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    stop_id = eos_token_id(tokenizer) if stop_on_eos else None
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    output_ids = model.generate(
+        prompt_tensor,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        eos_token_id=stop_id,
+    )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - started
+
+    tokens_generated = int(output_ids.shape[1] - prompt_tensor.shape[1])
+    if tokens_generated < 1 or tokens_generated > max_new_tokens:
+        raise RuntimeError(
+            f"Expected between 1 and {max_new_tokens} new tokens, got {tokens_generated}."
+        )
+    continuation_ids = output_ids[0].tolist()[len(prompt_ids) :]
+    continuation_text = tokenizer.decode(continuation_ids, skip_special_tokens=True)
+    text = prompt_text + continuation_text
+    peak_mb = None
+    if device.type == "cuda":
+        peak_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
+    stopped_on_eos = bool(
+        stop_id is not None and continuation_ids and continuation_ids[-1] == stop_id
+    )
+    chars_generated = len(continuation_text)
+    return {
+        "prompt": prompt_text,
+        "temperature": temperature,
+        "top_k": top_k,
+        "max_new_tokens": max_new_tokens,
+        "seed": seed,
+        "generated_text": text,
+        "continuation_text": continuation_text,
+        "generation_time_seconds": elapsed,
+        "tokens_generated": tokens_generated,
+        "tokens_per_second": tokens_generated / elapsed if elapsed > 0 else 0.0,
+        "characters_generated": chars_generated,
+        "characters_per_second": chars_generated / elapsed if elapsed > 0 else 0.0,
         "peak_gpu_memory_mb": peak_mb,
         "stopped_on_eos": stopped_on_eos,
         "eos_supported": stop_id is not None,

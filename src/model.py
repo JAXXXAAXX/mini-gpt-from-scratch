@@ -22,23 +22,37 @@ class MiniGPT(nn.Module):
         num_heads: int,
         num_layers: int,
         dropout: float,
+        position_encoding: str = "absolute",
     ):
         super().__init__()
         if num_layers < 1:
             raise ValueError("num_layers must be at least 1.")
+        if position_encoding not in {"absolute", "rope"}:
+            raise ValueError('position_encoding must be "absolute" or "rope".')
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.embedding_dim = embedding_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
+        self.position_encoding = position_encoding
         # Token IDs are integer indexes, not semantic vectors.
         # This table maps each id to a learnable vector of length embedding_dim.
         self.token_embedding = nn.Embedding(vocab_size, embedding_dim)
-        # Each position 0 .. block_size-1 gets its own learnable vector.
-        self.position_embedding = nn.Embedding(block_size, embedding_dim)
+        # Absolute mode learns one vector per context position.
+        # RoPE mode omits that table and rotates Q and K inside attention instead.
+        if position_encoding == "absolute":
+            self.position_embedding = nn.Embedding(block_size, embedding_dim)
+        else:
+            self.position_embedding = None
         self.blocks = nn.ModuleList(
             [
-                TransformerBlock(embedding_dim, num_heads, block_size, dropout)
+                TransformerBlock(
+                    embedding_dim,
+                    num_heads,
+                    block_size,
+                    dropout,
+                    position_encoding,
+                )
                 for _ in range(num_layers)
             ]
         )
@@ -55,12 +69,18 @@ class MiniGPT(nn.Module):
                 f"which is longer than block_size {self.block_size}."
             )
 
-        # Positions are 0, 1, 2, ..., T - 1, on the same device as the token ids.
-        positions = torch.arange(seq_len, device=x.device)
         token_emb = self.token_embedding(x)  # [B, T] -> [B, T, C]
-        position_emb = self.position_embedding(positions)  # [T] -> [T, C]
-        # Both tensors use embedding_dim, so [T, C] broadcasts across the batch.
-        hidden = token_emb + position_emb  # [B, T, C]
+        if self.position_encoding == "absolute":
+            # Positions are 0, 1, 2, ..., T - 1, on the same device as the token ids.
+            positions = torch.arange(seq_len, device=x.device)
+            position_emb = self.position_embedding(positions)  # [T] -> [T, C]
+            # Both tensors use embedding_dim, so [T, C] broadcasts across the batch.
+            hidden = token_emb + position_emb  # [B, T, C]
+        else:
+            # Position enters later, as a rotation of Q and K. The residual stream
+            # starts as token content only.
+            hidden = token_emb
+        embedded = hidden
 
         block_outputs = []
         for block in self.blocks:
@@ -77,17 +97,22 @@ class MiniGPT(nn.Module):
             return logits
         return logits, {
             "token_ids": x,
-            "embeddings": token_emb + position_emb,
+            "embeddings": embedded,
             "blocks": block_outputs,
             "final_ln": normalized,
             "logits": logits,
         }
 
     def architecture_summary(self) -> str:
+        position_line = (
+            "├── Learned Position Embedding\n"
+            if self.position_encoding == "absolute"
+            else "├── RoPE on Q and K\n"
+        )
         return (
             "MiniGPT\n"
             "├── Token Embedding\n"
-            "├── Position Embedding\n"
+            f"{position_line}"
             f"├── Transformer Blocks × {self.num_layers}\n"
             "├── Final LayerNorm\n"
             "└── LM Head\n"
@@ -96,7 +121,8 @@ class MiniGPT(nn.Module):
             f"Heads: {self.num_heads}\n"
             f"Layers: {self.num_layers}\n"
             f"Context Length: {self.block_size}\n"
-            f"Vocabulary Size: {self.vocab_size}"
+            f"Vocabulary Size: {self.vocab_size}\n"
+            f"Position Encoding: {self.position_encoding}"
         )
 
     @torch.inference_mode()
@@ -153,6 +179,43 @@ class MiniGPT(nn.Module):
         return generated
 
 
+def build_rope_cache(head_dim: int, block_size: int, base: float = 10000.0) -> tuple[torch.Tensor, torch.Tensor]:
+    """Precompute sine and cosine for every position up to block_size.
+
+    The result is two tables of shape [block_size, head_dim / 2]. Pair i of
+    the head uses column i. Lower pairs rotate slowly across the context.
+    Higher pairs rotate faster.
+    """
+
+    if head_dim % 2 != 0:
+        raise ValueError(f"RoPE needs an even head dimension, got {head_dim}.")
+    half = head_dim // 2
+    frequencies = 1.0 / (base ** (torch.arange(half, dtype=torch.float32) / half))
+    positions = torch.arange(block_size, dtype=torch.float32)
+    angles = torch.outer(positions, frequencies)
+    return angles.cos(), angles.sin()
+
+
+def apply_rope(values: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotate paired channels of one Q or K tensor.
+
+    values has shape [batch, time, head_dim]. cos and sin have shape
+    [block_size, head_dim / 2] and are sliced to the current time length.
+    Channel 2i and channel 2i+1 are one pair. Do not pass V.
+    """
+
+    steps = values.shape[1]
+    pair_cos = cos[:steps].to(dtype=values.dtype).unsqueeze(0)
+    pair_sin = sin[:steps].to(dtype=values.dtype).unsqueeze(0)
+    even = values[..., 0::2]
+    odd = values[..., 1::2]
+    rotated = torch.stack(
+        (even * pair_cos - odd * pair_sin, even * pair_sin + odd * pair_cos),
+        dim=-1,
+    )
+    return rotated.flatten(-2)
+
+
 class SelfAttentionHead(nn.Module):
     """One causal self-attention head.
 
@@ -163,10 +226,20 @@ class SelfAttentionHead(nn.Module):
     from reading future tokens.
     """
 
-    def __init__(self, embedding_dim: int, head_dim: int, block_size: int, dropout: float):
+    def __init__(
+        self,
+        embedding_dim: int,
+        head_dim: int,
+        block_size: int,
+        dropout: float,
+        position_encoding: str = "absolute",
+    ):
         super().__init__()
+        if position_encoding not in {"absolute", "rope"}:
+            raise ValueError('position_encoding must be "absolute" or "rope".')
         self.head_dim = head_dim
         self.block_size = block_size
+        self.position_encoding = position_encoding
         self.query = nn.Linear(embedding_dim, head_dim, bias=False)
         self.key = nn.Linear(embedding_dim, head_dim, bias=False)
         self.value = nn.Linear(embedding_dim, head_dim, bias=False)
@@ -174,6 +247,11 @@ class SelfAttentionHead(nn.Module):
         # A buffer moves with .to(device), unlike a plain tensor saved on self.
         mask = torch.tril(torch.ones(block_size, block_size, dtype=torch.bool))
         self.register_buffer("causal_mask", mask)
+        if position_encoding == "rope":
+            cos, sin = build_rope_cache(head_dim, block_size)
+            # Recomputed in __init__, so the tables are not stored in checkpoints.
+            self.register_buffer("rope_cos", cos, persistent=False)
+            self.register_buffer("rope_sin", sin, persistent=False)
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         # x is the input representation, shape [B, T, C].
@@ -191,6 +269,10 @@ class SelfAttentionHead(nn.Module):
         q = self.query(x)
         k = self.key(x)
         v = self.value(x)
+        if self.position_encoding == "rope":
+            # Rotate Q and K by their token positions. V is left unchanged.
+            q = apply_rope(q, self.rope_cos, self.rope_sin)
+            k = apply_rope(k, self.rope_cos, self.rope_sin)
 
         # scores[b, i, j] is how well token i's query matches token j's key.
         # K is transposed so each query dots with every key: [B, T, H] @ [B, H, T].
@@ -222,7 +304,14 @@ class SelfAttentionHead(nn.Module):
 class MultiHeadAttention(nn.Module):
     """Several causal heads, concatenated, then mixed by an output projection."""
 
-    def __init__(self, embedding_dim: int, num_heads: int, block_size: int, dropout: float):
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_heads: int,
+        block_size: int,
+        dropout: float,
+        position_encoding: str = "absolute",
+    ):
         super().__init__()
         if num_heads < 1:
             raise ValueError("num_heads must be at least 1.")
@@ -233,10 +322,22 @@ class MultiHeadAttention(nn.Module):
         self.embedding_dim = embedding_dim
         self.num_heads = num_heads
         self.head_dim = embedding_dim // num_heads
+        self.position_encoding = position_encoding
+        if position_encoding == "rope" and self.head_dim % 2 != 0:
+            raise ValueError(
+                f"RoPE needs an even head dimension, got {self.head_dim} "
+                f"from embedding_dim={embedding_dim} and num_heads={num_heads}."
+            )
         # Each head has its own Q, K, and V, so each can learn a different pattern.
         self.heads = nn.ModuleList(
             [
-                SelfAttentionHead(embedding_dim, self.head_dim, block_size, dropout)
+                SelfAttentionHead(
+                    embedding_dim,
+                    self.head_dim,
+                    block_size,
+                    dropout,
+                    position_encoding,
+                )
                 for _ in range(num_heads)
             ]
         )
@@ -296,10 +397,23 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     """One Pre-Norm block: attention, then a feed-forward network, each with a residual."""
 
-    def __init__(self, embedding_dim: int, num_heads: int, block_size: int, dropout: float):
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_heads: int,
+        block_size: int,
+        dropout: float,
+        position_encoding: str = "absolute",
+    ):
         super().__init__()
         self.ln1 = nn.LayerNorm(embedding_dim)
-        self.attention = MultiHeadAttention(embedding_dim, num_heads, block_size, dropout)
+        self.attention = MultiHeadAttention(
+            embedding_dim,
+            num_heads,
+            block_size,
+            dropout,
+            position_encoding,
+        )
         self.ln2 = nn.LayerNorm(embedding_dim)
         self.ffn = FeedForward(embedding_dim, dropout)
 

@@ -1,10 +1,12 @@
 """Train MiniGPT for next-token prediction on TinyStories.
 
-Supports character (v1) and BPE (v2) tokenizers via config.TOKENIZER_TYPE.
-BPE training never overwrites the v1 character checkpoint or tokenizer.
+Supports v1, v2, v2.1, and v2.2 via config.EXPERIMENT.
+BPE training never overwrites an existing BPE vocabulary.
+v2.2 resumes v2.1 and writes only to the v2.2 checkpoint paths.
 """
 
 import sys
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
@@ -19,6 +21,7 @@ from src.tokenizer_utils import encode_stories, parameter_breakdown, resolve_tok
 from src.trainer import (
     load_checkpoint,
     overfit_one_batch,
+    save_checkpoint,
     save_training_artifacts,
     train_steps,
 )
@@ -32,21 +35,30 @@ def build_model(vocab_size: int, device: torch.device) -> MiniGPT:
         num_heads=config.NUM_HEADS,
         num_layers=config.NUM_LAYERS,
         dropout=config.DROPOUT,
+        position_encoding=config.POSITION_ENCODING,
     ).to(device)
 
 
 def build_or_load_tokenizer(train_stories: list[str], resume_path: str | None):
     kind = resolve_tokenizer_type()
     if kind == "bpe":
-        if resume_path:
+        bpe_path = Path(config.BPE_TOKENIZER_PATH)
+        if bpe_path.exists():
+            # Keep the v2 vocabulary. A new merge file would make v2 and v3 incomparable.
             tokenizer = BPETokenizer.load(config.BPE_TOKENIZER_PATH)
-        else:
-            tokenizer = BPETokenizer()
-            print(f"Training BPE tokenizer on {len(train_stories)} train stories only...")
-            tokenizer.train(train_stories, vocab_size=config.BPE_VOCAB_SIZE)
-            tokenizer.save(config.BPE_TOKENIZER_PATH)
-            print(f"Saved BPE tokenizer: {config.BPE_TOKENIZER_PATH}")
+            print(f"Loaded existing BPE tokenizer: {config.BPE_TOKENIZER_PATH}")
             print(f"BPE vocab size: {tokenizer.vocab_size}")
+            return tokenizer, True
+        if resume_path:
+            raise FileNotFoundError(
+                f"Cannot resume a BPE run without the tokenizer at {config.BPE_TOKENIZER_PATH}."
+            )
+        tokenizer = BPETokenizer()
+        print(f"Training BPE tokenizer on {len(train_stories)} train stories only...")
+        tokenizer.train(train_stories, vocab_size=config.BPE_VOCAB_SIZE)
+        tokenizer.save(config.BPE_TOKENIZER_PATH)
+        print(f"Saved BPE tokenizer: {config.BPE_TOKENIZER_PATH}")
+        print(f"BPE vocab size: {tokenizer.vocab_size}")
         return tokenizer, True
 
     train_text = prepare_text(train_stories)
@@ -68,9 +80,22 @@ def main():
     print("Device:", device.type)
     print("CUDA available:", torch.cuda.is_available())
     print("GPU name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
+    print("Experiment:", config.EXPERIMENT)
     print("Tokenizer type:", tokenizer_type)
     print("Block size:", config.BLOCK_SIZE, "tokenizer units")
-    if tokenizer_type == "bpe":
+    print("Batch size:", config.BATCH_SIZE)
+    print("Tokens per step:", config.BATCH_SIZE * config.BLOCK_SIZE)
+    if config.EXPERIMENT == "v2_2_ctx256_longtrain":
+        print(
+            "v2.2 keeps context 256 and batch 8 (2048 tokens/step) and trains "
+            f"through {config.MAX_STEPS} total steps."
+        )
+    elif config.EXPERIMENT == "v2_1_ctx256":
+        print(
+            "v2.1 changes only context length. Batch size is 8 so each step still "
+            "sees 2048 tokens, matching v2 (batch 32 x context 64)."
+        )
+    elif tokenizer_type == "bpe":
         print(
             "Note: 64 BPE tokens span much more text than 64 character tokens. "
             "block_size is intentionally unchanged for this controlled comparison."
@@ -102,10 +127,63 @@ def main():
     model = build_model(tokenizer.vocab_size, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
     start_step = 0
+    best_validation_loss = float("inf")
+    initial_history = None
+    resume_meta = {
+        "resumed": False,
+        "mode": "trained fresh",
+        "position_encoding": config.POSITION_ENCODING,
+    }
+    if config.POSITION_ENCODING == "rope" and resume_path:
+        raise RuntimeError(
+            "A RoPE run must start from fresh weights. "
+            "RESUME_CHECKPOINT has to stay empty for this experiment."
+        )
     if resume_path:
+        if not Path(resume_path).exists():
+            raise FileNotFoundError(
+                f"Cannot resume because {resume_path} is missing. "
+                "Refusing to train a fresh run in its place."
+            )
         checkpoint = load_checkpoint(resume_path, model, optimizer, device)
-        start_step = checkpoint["step"]
-        print(f"Resumed from {resume_path} at step {start_step}")
+        start_step = int(checkpoint["step"])
+        if start_step >= config.MAX_STEPS:
+            raise RuntimeError(
+                f"Checkpoint step {start_step} is already at or past MAX_STEPS "
+                f"{config.MAX_STEPS}. Refusing to train extra unplanned steps."
+            )
+        resumed_train = float(checkpoint["train_loss"])
+        resumed_val = float(checkpoint["validation_loss"])
+        best_validation_loss = resumed_val
+        initial_history = [
+            {
+                "step": start_step,
+                "train_loss": resumed_train,
+                "validation_loss": resumed_val,
+                "validation_perplexity": float(torch.exp(torch.tensor(resumed_val))),
+                "mean_grad_norm": None,
+                "max_grad_norm": None,
+                "elapsed_seconds": 0.0,
+                "source": "resumed_checkpoint",
+            }
+        ]
+        resume_meta = {
+            "resumed": True,
+            "mode": "resumed from v2.1",
+            "from_checkpoint": resume_path,
+            "from_step": start_step,
+            "target_total_steps": config.MAX_STEPS,
+            "additional_steps": config.MAX_STEPS - start_step,
+            "resumed_validation_loss": resumed_val,
+            "note": (
+                "The target is 3000 total steps. This is not 1000 previous steps "
+                "plus 3000 new steps."
+            ),
+        }
+        print(
+            f"Resumed from {resume_path} at step {start_step}. "
+            f"Training continues through step {config.MAX_STEPS}."
+        )
 
     if "--overfit" in sys.argv:
         # A fresh optimizer state on one repeated batch. This does not touch checkpoints.
@@ -124,6 +202,18 @@ def main():
             raise RuntimeError("Overfit check failed: loss did not decrease on one repeated batch.")
         return
 
+    if initial_history is not None:
+        # Keep the resumed step eligible as the best v2.2 model if later evals are worse.
+        resumed_point = initial_history[0]
+        save_checkpoint(
+            Path(config.BEST_CHECKPOINT),
+            model,
+            optimizer,
+            int(resumed_point["step"]),
+            float(resumed_point["train_loss"]),
+            float(resumed_point["validation_loss"]),
+        )
+
     trained = train_steps(
         model,
         optimizer,
@@ -131,6 +221,8 @@ def main():
         valid_loader,
         device,
         start_step=start_step,
+        best_validation_loss=best_validation_loss,
+        initial_history=initial_history,
         best_checkpoint_path=config.BEST_CHECKPOINT,
         latest_checkpoint_path=config.LATEST_CHECKPOINT,
         characters_per_token=characters_per_token,
@@ -141,6 +233,11 @@ def main():
         **trained,
         "device": device.type,
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "experiment": config.EXPERIMENT,
+        "resume": resume_meta,
+        "loss_curve_path": config.LOSS_CURVE_PATH,
+        "tokens_per_step": config.BATCH_SIZE * config.BLOCK_SIZE,
+        "planned_target_tokens": config.BATCH_SIZE * config.BLOCK_SIZE * config.MAX_STEPS,
         "tokenizer_type": tokenizer_type,
         "tokenizer_path": config.TOKENIZER_PATH,
         "vocab_size": tokenizer.vocab_size,
@@ -149,6 +246,7 @@ def main():
         "num_heads": config.NUM_HEADS,
         "num_layers": config.NUM_LAYERS,
         "dropout": config.DROPOUT,
+        "position_encoding": config.POSITION_ENCODING,
         "batch_size": config.BATCH_SIZE,
         "learning_rate": config.LEARNING_RATE,
         "max_steps": config.MAX_STEPS,
