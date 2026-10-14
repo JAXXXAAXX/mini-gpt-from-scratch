@@ -1,10 +1,11 @@
 """Train MiniGPT for next-token prediction on TinyStories.
 
-Supports v1 through v2.5 via config.EXPERIMENT.
+Supports v1 through v2.7 via config.EXPERIMENT.
 BPE training never overwrites an existing BPE vocabulary.
 v2.2 resumes v2.1 and writes only to the v2.2 checkpoint paths.
 v2.4 trains a fresh RoPE model on 20,000 stories and does not overwrite v2.3.
 v2.5 widens that RoPE model and does not overwrite v2.4.
+v2.6/v2.7 fine-tune v2.5 on User/Assistant dialogue for topical replies.
 """
 
 import sys
@@ -17,9 +18,15 @@ import config
 from src.bpe_tokenizer import BPETokenizer
 from src.data_utils import load_tinystories, prepare_text
 from src.dataset import TextDataset
+from src.dialogue_data import build_synthetic_dialogues, dialogue_and_story_documents
 from src.model import MiniGPT
 from src.tokenizer import Tokenizer
-from src.tokenizer_utils import encode_stories, parameter_breakdown, resolve_tokenizer_type
+from src.tokenizer_utils import (
+    encode_documents,
+    encode_stories,
+    parameter_breakdown,
+    resolve_tokenizer_type,
+)
 from src.trainer import (
     load_checkpoint,
     overfit_one_batch,
@@ -87,7 +94,21 @@ def main():
     print("Block size:", config.BLOCK_SIZE, "tokenizer units")
     print("Batch size:", config.BATCH_SIZE)
     print("Tokens per step:", config.BATCH_SIZE * config.BLOCK_SIZE)
-    if config.EXPERIMENT == "v2_5_width256":
+    if config.EXPERIMENT == "v2_7_reply_generalize":
+        print(
+            "v2.7 restarts dialogue fine-tuning from v2.5 with compositional chat data. "
+            f"Learning rate {config.LEARNING_RATE}, story mix ratio "
+            f"{config.STORY_MIX_RATIO}, target step {config.MAX_STEPS}. "
+            "Success is judged on held-out reply prompts, not memorized templates."
+        )
+    elif config.EXPERIMENT == "v2_6_reply_ft":
+        print(
+            "v2.6 fine-tunes the v2.5 RoPE model on User/Assistant dialogue. "
+            f"Learning rate {config.LEARNING_RATE}, story mix ratio "
+            f"{config.STORY_MIX_RATIO}, target step {config.MAX_STEPS}. "
+            "Validation is scored on held-out chat documents."
+        )
+    elif config.EXPERIMENT == "v2_5_width256":
         print(
             "v2.5 keeps RoPE, context 256, batch 8, and the 20,000-story slice. "
             f"Width changes to embedding {config.EMBEDDING_DIM}, "
@@ -128,9 +149,27 @@ def main():
     )
     tokenizer, use_boundaries = build_or_load_tokenizer(train_stories, resume_path)
 
-    train_ids = encode_stories(tokenizer, train_stories, use_story_boundaries=use_boundaries)
-    valid_ids = encode_stories(tokenizer, valid_stories, use_story_boundaries=use_boundaries)
-    train_chars = sum(len(story) for story in train_stories)
+    dialogue_train_docs: list[str] = []
+    dialogue_valid_docs: list[str] = []
+    if config.DATA_MODE == "dialogue_mix":
+        dialogue_train_docs, dialogue_valid_docs = build_synthetic_dialogues()
+        train_docs = dialogue_and_story_documents(
+            dialogue_train_docs,
+            train_stories,
+            story_ratio=config.STORY_MIX_RATIO,
+        )
+        train_ids = encode_documents(tokenizer, train_docs)
+        valid_ids = encode_documents(tokenizer, dialogue_valid_docs)
+        train_chars = sum(len(doc) for doc in train_docs)
+        print(
+            f"Dialogue train docs: {len(dialogue_train_docs)}; "
+            f"mixed train docs: {len(train_docs)}; "
+            f"dialogue valid docs: {len(dialogue_valid_docs)}"
+        )
+    else:
+        train_ids = encode_stories(tokenizer, train_stories, use_story_boundaries=use_boundaries)
+        valid_ids = encode_stories(tokenizer, valid_stories, use_story_boundaries=use_boundaries)
+        train_chars = sum(len(story) for story in train_stories)
     characters_per_token = train_chars / len(train_ids) if train_ids else 0.0
 
     train_loader = DataLoader(
@@ -155,7 +194,7 @@ def main():
         "mode": "trained fresh",
         "position_encoding": config.POSITION_ENCODING,
     }
-    if config.POSITION_ENCODING == "rope" and resume_path:
+    if config.POSITION_ENCODING == "rope" and resume_path and not config.ALLOW_ROPE_RESUME:
         raise RuntimeError(
             "A RoPE run must start from fresh weights. "
             "RESUME_CHECKPOINT has to stay empty for this experiment."
@@ -166,16 +205,37 @@ def main():
                 f"Cannot resume because {resume_path} is missing. "
                 "Refusing to train a fresh run in its place."
             )
-        checkpoint = load_checkpoint(resume_path, model, optimizer, device)
-        start_step = int(checkpoint["step"])
+        if config.EXPERIMENT in {"v2_6_reply_ft", "v2_7_reply_generalize"}:
+            # Keep v2.5 weights, but use a fresh optimizer at the fine-tune learning rate.
+            # Dialogue validation is a new domain, so do not carry the TinyStories best loss.
+            checkpoint = torch.load(resume_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
+            start_step = int(checkpoint["step"])
+            resumed_train = float(checkpoint["train_loss"])
+            resumed_val = float(checkpoint["validation_loss"])
+            best_validation_loss = float("inf")
+            resume_mode = f"fine-tuned from v2.5 on dialogue ({config.EXPERIMENT})"
+            resume_note = (
+                "Weights come from v2.5. The optimizer is restarted at the fine-tune "
+                "learning rate. Validation now tracks dialogue loss, not TinyStories loss."
+            )
+        else:
+            checkpoint = load_checkpoint(resume_path, model, optimizer, device)
+            start_step = int(checkpoint["step"])
+            resumed_train = float(checkpoint["train_loss"])
+            resumed_val = float(checkpoint["validation_loss"])
+            best_validation_loss = resumed_val
+            resume_mode = "resumed from v2.1"
+            resume_note = (
+                "The target is 3000 total steps. This is not 1000 previous steps "
+                "plus 3000 new steps."
+            )
         if start_step >= config.MAX_STEPS:
             raise RuntimeError(
                 f"Checkpoint step {start_step} is already at or past MAX_STEPS "
                 f"{config.MAX_STEPS}. Refusing to train extra unplanned steps."
             )
-        resumed_train = float(checkpoint["train_loss"])
-        resumed_val = float(checkpoint["validation_loss"])
-        best_validation_loss = resumed_val
         initial_history = [
             {
                 "step": start_step,
@@ -190,16 +250,13 @@ def main():
         ]
         resume_meta = {
             "resumed": True,
-            "mode": "resumed from v2.1",
+            "mode": resume_mode,
             "from_checkpoint": resume_path,
             "from_step": start_step,
             "target_total_steps": config.MAX_STEPS,
             "additional_steps": config.MAX_STEPS - start_step,
             "resumed_validation_loss": resumed_val,
-            "note": (
-                "The target is 3000 total steps. This is not 1000 previous steps "
-                "plus 3000 new steps."
-            ),
+            "note": resume_note,
         }
         print(
             f"Resumed from {resume_path} at step {start_step}. "
@@ -223,7 +280,10 @@ def main():
             raise RuntimeError("Overfit check failed: loss did not decrease on one repeated batch.")
         return
 
-    if initial_history is not None:
+    if initial_history is not None and config.EXPERIMENT not in {
+        "v2_6_reply_ft",
+        "v2_7_reply_generalize",
+    }:
         # Keep the resumed step eligible as the best v2.2 model if later evals are worse.
         resumed_point = initial_history[0]
         save_checkpoint(

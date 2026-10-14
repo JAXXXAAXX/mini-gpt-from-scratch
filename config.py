@@ -16,7 +16,9 @@ TOKENIZER_TYPE = "bpe"
 # "v2_3_rope_ctx256"      same budget as v2.2, fresh weights, RoPE on Q and K
 # "v2_4_stories20k"       same RoPE model, 20,000 stories, 12,000 steps
 # "v2_5_width256"         same data/budget as v2.4, embedding 256 and 8 heads
-EXPERIMENT = "v2_5_width256"
+# "v2_6_reply_ft"         fine-tune v2.5 on User/Assistant dialogue for topic replies
+# "v2_7_reply_generalize" restart dialogue fine-tune with compositional held-out-ready data
+EXPERIMENT = "v2_7_reply_generalize"
 
 CHAR_TOKENIZER_PATH = "data/processed/tokenizer.json"
 BPE_TOKENIZER_PATH = "data/processed/bpe_tokenizer.json"
@@ -57,6 +59,26 @@ V2_5_TRAIN_STORIES = 20000
 V2_5_EMBEDDING_DIM = 256
 V2_5_NUM_HEADS = 8
 V2_5_NUM_LAYERS = 4
+# Fine-tune the v2.5 body on chat data. Extra steps continue from the resumed step.
+V2_6_BLOCK_SIZE = 256
+V2_6_BATCH_SIZE = 8
+V2_6_MAX_STEPS = 14600
+V2_6_TRAIN_STORIES = 2000
+V2_6_EMBEDDING_DIM = 256
+V2_6_NUM_HEADS = 8
+V2_6_NUM_LAYERS = 4
+V2_6_LEARNING_RATE = 1e-4
+V2_6_STORY_RATIO = 0.15
+# Same body as v2.6, but new dialogue generator and held-out reply checks.
+V2_7_BLOCK_SIZE = 256
+V2_7_BATCH_SIZE = 8
+V2_7_MAX_STEPS = 15600
+V2_7_TRAIN_STORIES = 2000
+V2_7_EMBEDDING_DIM = 256
+V2_7_NUM_HEADS = 8
+V2_7_NUM_LAYERS = 4
+V2_7_LEARNING_RATE = 8e-5
+V2_7_STORY_RATIO = 0.10
 
 BLOCK_SIZE = V2_BPE_BLOCK_SIZE
 EMBEDDING_DIM = 128
@@ -65,6 +87,11 @@ NUM_HEADS = 4
 NUM_LAYERS = 4
 
 DROPOUT = 0.1
+
+# "stories" = TinyStories only. "dialogue_mix" = chat docs plus a smaller story share.
+DATA_MODE = "stories"
+USE_CHAT_TEMPLATE = False
+STORY_MIX_RATIO = 0.0
 
 
 # Training configuration
@@ -82,6 +109,7 @@ GRAD_CLIP = 1.0
 # Set to a checkpoint path to continue. A fresh BPE run reuses the saved
 # tokenizer when it already exists and does not overwrite that vocabulary.
 RESUME_CHECKPOINT = None
+ALLOW_ROPE_RESUME = False
 
 # Overfit one batch for this many steps when train.py is run with --overfit.
 OVERFIT_STEPS = 40
@@ -154,13 +182,80 @@ V2_5_LOSS_CURVE_PATH = "experiments/loss_curve_v2_5_width256.png"
 V2_5_STORY_EVAL_JSON = "experiments/story_eval_v2_5_width256.json"
 V2_5_STORY_EVAL_REPORT = "experiments/story_eval_v2_5_width256.md"
 
+# v2.6 resumes v2.5 and writes only reply-finetune artifacts.
+V2_6_BEST_CHECKPOINT = "checkpoints/v2_6_reply_ft_best.pt"
+V2_6_LATEST_CHECKPOINT = "checkpoints/v2_6_reply_ft_latest.pt"
+V2_6_HISTORY_PATH = "experiments/training_history_v2_6_reply_ft.json"
+V2_6_REPORT_PATH = "experiments/training_report_v2_6_reply_ft.md"
+V2_6_LOSS_CURVE_PATH = "experiments/loss_curve_v2_6_reply_ft.png"
+V2_6_STORY_EVAL_JSON = "experiments/story_eval_v2_6_reply_ft.json"
+V2_6_STORY_EVAL_REPORT = "experiments/story_eval_v2_6_reply_ft.md"
+V2_6_REPLY_EVAL_JSON = "experiments/reply_eval_v2_5_v2_6.json"
+V2_6_REPLY_EVAL_REPORT = "experiments/reply_eval_v2_5_v2_6.md"
+
+V2_7_BEST_CHECKPOINT = "checkpoints/v2_7_reply_generalize_best.pt"
+V2_7_LATEST_CHECKPOINT = "checkpoints/v2_7_reply_generalize_latest.pt"
+V2_7_HISTORY_PATH = "experiments/training_history_v2_7_reply_generalize.json"
+V2_7_REPORT_PATH = "experiments/training_report_v2_7_reply_generalize.md"
+V2_7_LOSS_CURVE_PATH = "experiments/loss_curve_v2_7_reply_generalize.png"
+V2_7_STORY_EVAL_JSON = "experiments/story_eval_v2_7_reply_generalize.json"
+V2_7_STORY_EVAL_REPORT = "experiments/story_eval_v2_7_reply_generalize.md"
+V2_7_REPLY_EVAL_JSON = "experiments/reply_eval_v2_6_v2_7.json"
+V2_7_REPLY_EVAL_REPORT = "experiments/reply_eval_v2_6_v2_7.md"
+
 TOKENIZER_COMPARISON_REPORT = "experiments/tokenizer_comparison.md"
 TOKENIZER_COMPARISON_JSON = "experiments/tokenizer_comparison.json"
 
 # "absolute" keeps the learned position table. "rope" rotates Q and K only.
 POSITION_ENCODING = "absolute"
 
-if TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_5_width256":
+if TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_7_reply_generalize":
+    TOKENIZER_PATH = BPE_TOKENIZER_PATH
+    BLOCK_SIZE = V2_7_BLOCK_SIZE
+    BATCH_SIZE = V2_7_BATCH_SIZE
+    MAX_STEPS = V2_7_MAX_STEPS
+    NUM_TRAIN_STORIES = V2_7_TRAIN_STORIES
+    EMBEDDING_DIM = V2_7_EMBEDDING_DIM
+    NUM_HEADS = V2_7_NUM_HEADS
+    NUM_LAYERS = V2_7_NUM_LAYERS
+    LEARNING_RATE = V2_7_LEARNING_RATE
+    POSITION_ENCODING = "rope"
+    DATA_MODE = "dialogue_mix"
+    USE_CHAT_TEMPLATE = True
+    STORY_MIX_RATIO = V2_7_STORY_RATIO
+    RESUME_CHECKPOINT = V2_5_BEST_CHECKPOINT
+    ALLOW_ROPE_RESUME = True
+    BEST_CHECKPOINT = V2_7_BEST_CHECKPOINT
+    LATEST_CHECKPOINT = V2_7_LATEST_CHECKPOINT
+    HISTORY_PATH = V2_7_HISTORY_PATH
+    REPORT_PATH = V2_7_REPORT_PATH
+    LOSS_CURVE_PATH = V2_7_LOSS_CURVE_PATH
+    STORY_EVAL_JSON = V2_7_STORY_EVAL_JSON
+    STORY_EVAL_REPORT = V2_7_STORY_EVAL_REPORT
+elif TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_6_reply_ft":
+    TOKENIZER_PATH = BPE_TOKENIZER_PATH
+    BLOCK_SIZE = V2_6_BLOCK_SIZE
+    BATCH_SIZE = V2_6_BATCH_SIZE
+    MAX_STEPS = V2_6_MAX_STEPS
+    NUM_TRAIN_STORIES = V2_6_TRAIN_STORIES
+    EMBEDDING_DIM = V2_6_EMBEDDING_DIM
+    NUM_HEADS = V2_6_NUM_HEADS
+    NUM_LAYERS = V2_6_NUM_LAYERS
+    LEARNING_RATE = V2_6_LEARNING_RATE
+    POSITION_ENCODING = "rope"
+    DATA_MODE = "dialogue_mix"
+    USE_CHAT_TEMPLATE = True
+    STORY_MIX_RATIO = V2_6_STORY_RATIO
+    RESUME_CHECKPOINT = V2_5_BEST_CHECKPOINT
+    ALLOW_ROPE_RESUME = True
+    BEST_CHECKPOINT = V2_6_BEST_CHECKPOINT
+    LATEST_CHECKPOINT = V2_6_LATEST_CHECKPOINT
+    HISTORY_PATH = V2_6_HISTORY_PATH
+    REPORT_PATH = V2_6_REPORT_PATH
+    LOSS_CURVE_PATH = V2_6_LOSS_CURVE_PATH
+    STORY_EVAL_JSON = V2_6_STORY_EVAL_JSON
+    STORY_EVAL_REPORT = V2_6_STORY_EVAL_REPORT
+elif TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_5_width256":
     TOKENIZER_PATH = BPE_TOKENIZER_PATH
     BLOCK_SIZE = V2_5_BLOCK_SIZE
     BATCH_SIZE = V2_5_BATCH_SIZE
@@ -262,8 +357,8 @@ elif TOKENIZER_TYPE == "char" and EXPERIMENT == "v1":
 else:
     raise ValueError(
         "Unsupported profile. Use EXPERIMENT 'v1', 'v2_bpe', 'v2_1_ctx256', "
-        "'v2_2_ctx256_longtrain', 'v2_3_rope_ctx256', 'v2_4_stories20k', or "
-        "'v2_5_width256'. "
+        "'v2_2_ctx256_longtrain', 'v2_3_rope_ctx256', 'v2_4_stories20k', "
+        "'v2_5_width256', 'v2_6_reply_ft', or 'v2_7_reply_generalize'. "
         f"Got TOKENIZER_TYPE={TOKENIZER_TYPE!r}, EXPERIMENT={EXPERIMENT!r}."
     )
 

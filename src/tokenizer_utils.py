@@ -39,17 +39,25 @@ def encode_stories(
 ) -> list[int]:
     """Encode stories into one continuous token stream for TextDataset."""
     if use_story_boundaries:
-        ids: list[int] = []
-        for story in stories:
-            text = story.strip()
-            if not text:
-                continue
-            ids.extend(tokenizer.encode(text, add_bos=True, add_eos=True))
-        if not ids:
-            raise ValueError("Encoding stories produced an empty token stream.")
-        return ids
+        return encode_documents(tokenizer, stories)
 
     return tokenizer.encode(prepare_text(stories))
+
+
+def encode_documents(tokenizer: Tokenizer | BPETokenizer, documents: list[str]) -> list[int]:
+    """Encode each document with BOS/EOS, then concatenate for windowed training."""
+    ids: list[int] = []
+    for document in documents:
+        text = document.strip()
+        if not text:
+            continue
+        if isinstance(tokenizer, BPETokenizer):
+            ids.extend(tokenizer.encode(text, add_bos=True, add_eos=True))
+        else:
+            ids.extend(tokenizer.encode(text))
+    if not ids:
+        raise ValueError("Encoding documents produced an empty token stream.")
+    return ids
 
 
 def story_token_counts(
