@@ -16,9 +16,15 @@ from pathlib import Path
 import torch
 
 import config
-from generate import generate_once, load_model
+from generate import encode_prompt, generate_once, load_model
 from src.dialogue_data import format_chat_prompt, trim_assistant_reply
-from src.tokenizer_utils import load_tokenizer, resolve_tokenizer_type
+from src.reply_grounding import (
+    faithfulness_score,
+    generate_grounded,
+    invented_attributes,
+    is_faithful,
+)
+from src.tokenizer_utils import eos_token_id, load_tokenizer, resolve_tokenizer_type
 
 STORY_MARKERS = (
     r"\bonce upon a time\b",
@@ -146,6 +152,34 @@ REPLY_PROMPTS = [
         "split": "held_out",
         "topic_terms": ["sam", "backpack", "school", "lost", "sorry", "last"],
     },
+    # Attribute-faithfulness probes from real panel failures. Exact lines stay out of training.
+    {
+        "prompt": "my mom has a car.",
+        "kind": "chat",
+        "split": "held_out",
+        "topic_terms": ["mom", "car"],
+        "forbidden_unless_prompt": ["red", "blue", "black", "green", "white"],
+    },
+    {
+        "prompt": "My mom has a black car.",
+        "kind": "chat",
+        "split": "held_out",
+        "topic_terms": ["mom", "car", "black"],
+    },
+    {
+        "prompt": "My mom broke her leg.",
+        "kind": "chat",
+        "split": "held_out",
+        "topic_terms": ["mom", "leg", "broke", "broken", "sorry"],
+        "forbidden_unless_prompt": ["arm", "arms", "hand", "foot"],
+    },
+    {
+        "prompt": "My dog is very upset about going to the hospital.",
+        "kind": "chat",
+        "split": "held_out",
+        "topic_terms": ["dog", "upset", "hospital"],
+        "forbidden_unless_prompt": ["sick", "vet", "fever"],
+    },
     {"prompt": "Once upon a time", "kind": "story", "split": "control", "topic_terms": ["once", "there", "was", "lived"]},
     {
         "prompt": "The little girl said",
@@ -211,6 +245,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Send the bare user text with no User/Assistant wrapper.",
     )
+    parser.add_argument(
+        "--no-grounded",
+        action="store_true",
+        help="Disable prompt-grounded candidate reranking for chat replies.",
+    )
     return parser.parse_args()
 
 
@@ -222,28 +261,61 @@ def score_model(
     use_chat_template: bool,
 ) -> dict:
     samples = []
+    use_grounded = use_chat_template and not args.no_grounded
     for item in REPLY_PROMPTS:
         prompt = item["prompt"]
         model_prompt = prompt if not use_chat_template else format_chat_prompt(prompt)
-        sample = generate_once(
-            model,
-            tokenizer,
-            prompt=model_prompt,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            seed=args.seed,
-            device=device,
-            stop_on_eos=True,
-        )
-        text = sample.get("generated_text") or ""
-        if text.startswith(model_prompt):
-            continuation = text[len(model_prompt) :]
+        if use_grounded and item["kind"] == "chat":
+            torch.manual_seed(args.seed)
+            if device.type == "cuda":
+                torch.cuda.manual_seed_all(args.seed)
+            prompt_ids = encode_prompt(tokenizer, model_prompt, device)[0].tolist()
+            continuation = generate_grounded(
+                model,
+                tokenizer,
+                prompt_ids,
+                user_text=prompt,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                device=device,
+                eos_token_id=eos_token_id(tokenizer),
+                candidates=12,
+            )
+            continuation = trim_assistant_reply(continuation)
+            tokens_generated = None
+            stopped_on_eos = None
         else:
-            continuation = text
-        continuation = trim_assistant_reply(continuation)
+            sample = generate_once(
+                model,
+                tokenizer,
+                prompt=model_prompt,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                seed=args.seed,
+                device=device,
+                stop_on_eos=True,
+            )
+            text = sample.get("generated_text") or ""
+            if text.startswith(model_prompt):
+                continuation = text[len(model_prompt) :]
+            else:
+                continuation = text
+            continuation = trim_assistant_reply(continuation)
+            tokens_generated = sample.get("tokens_generated")
+            stopped_on_eos = sample.get("stopped_on_eos")
         drift = story_drift(continuation, item["kind"])
         score = relevance_score(prompt, continuation, item["kind"], item["topic_terms"])
+        invented = invented_attributes(prompt, continuation)
+        forbidden = [
+            word
+            for word in item.get("forbidden_unless_prompt", [])
+            if word.lower() in continuation.lower() and word.lower() not in prompt.lower()
+        ]
+        faithful = is_faithful(prompt, continuation) and not forbidden
+        if item["kind"] == "chat" and not faithful and score > 0:
+            score = 0
         samples.append(
             {
                 "prompt": prompt,
@@ -253,8 +325,13 @@ def score_model(
                 "continuation": continuation,
                 "relevance": score,
                 "story_drift": drift,
-                "stopped_on_eos": sample.get("stopped_on_eos"),
-                "tokens_generated": sample.get("tokens_generated"),
+                "faithful": faithful,
+                "invented_attributes": invented,
+                "forbidden_hits": forbidden,
+                "faithfulness_score": faithfulness_score(prompt, continuation),
+                "stopped_on_eos": stopped_on_eos,
+                "tokens_generated": tokens_generated,
+                "grounded_decoding": use_grounded and item["kind"] == "chat",
             }
         )
 
@@ -268,6 +345,9 @@ def score_model(
         "chat_relevance_mean": sum(row["relevance"] for row in chat) / len(chat),
         "held_out_relevance_mean": (
             sum(row["relevance"] for row in held) / len(held) if held else None
+        ),
+        "held_out_faithful_rate": (
+            sum(1 for row in held if row["faithful"]) / len(held) if held else None
         ),
         "story_relevance_mean": sum(row["relevance"] for row in story) / len(story),
         "story_drift_rate": sum(1 for row in chat if row["story_drift"]) / len(chat),
@@ -287,6 +367,7 @@ def side_summary(label: str, result: dict, checkpoint: str) -> dict:
         "relevance_mean": result["relevance_mean"],
         "chat_relevance_mean": result["chat_relevance_mean"],
         "held_out_relevance_mean": result["held_out_relevance_mean"],
+        "held_out_faithful_rate": result["held_out_faithful_rate"],
         "story_relevance_mean": result["story_relevance_mean"],
         "story_drift_rate": result["story_drift_rate"],
         "held_out_story_drift_rate": result["held_out_story_drift_rate"],
@@ -324,6 +405,8 @@ def build_report(payload: dict) -> str:
                     f"- kind: {sample['kind']}",
                     f"- relevance: {sample['relevance']}",
                     f"- story drift: {'yes' if sample['story_drift'] else 'no'}",
+                    f"- faithful: {'yes' if sample.get('faithful') else 'no'}",
+                    f"- invented attributes: {', '.join(sample.get('invented_attributes') or []) or 'none'}",
                     "",
                 ]
             )
@@ -332,10 +415,11 @@ def build_report(payload: dict) -> str:
     success = payload.get("success") or {}
     if success:
         verdict = (
-            f"Held-out relevance improved: {success.get('held_out_relevance_improved')}. "
             f"Held-out relevance mean: {success.get('held_out_relevance_mean')}. "
-            f"Pass held-out relevance: {success.get('pass_held_out_relevance')}. "
-            f"Pass held-out drift: {success.get('pass_held_out_drift')}. "
+            f"Held-out faithful rate: {success.get('held_out_faithful_rate')}. "
+            f"Pass relevance: {success.get('pass_held_out_relevance')}. "
+            f"Pass faithful: {success.get('pass_held_out_faithful')}. "
+            f"Pass drift: {success.get('pass_held_out_drift')}. "
             f"Pass: {success.get('successful')}."
         )
     else:
@@ -350,6 +434,7 @@ Decoding: temperature {payload['decoding']['temperature']}, top-k {payload['deco
 | Metric | {headers} |
 |{"|".join(["---"] + ["---:"] * len(sides))}|
 {row("Held-out relevance mean (0-2)", "held_out_relevance_mean")}
+{row("Held-out faithful rate", "held_out_faithful_rate")}
 {row("Chat relevance mean (0-2)", "chat_relevance_mean")}
 {row("Overall relevance mean (0-2)", "relevance_mean")}
 {row("Story-control relevance mean", "story_relevance_mean")}
@@ -361,7 +446,7 @@ Decoding: temperature {payload['decoding']['temperature']}, top-k {payload['deco
 
 {verdict}
 
-Pass bar: held-out relevance mean at least 1.5, held-out story-drift at most 0.25, and both improved versus the baseline. In-distribution chat scores alone are not enough.
+Pass bar: held-out relevance mean at least 1.5, held-out faithful rate at least 0.8, held-out story-drift at most 0.25. Inventing colors, body parts, or illness terms absent from the user text counts as a failure.
 
 ## Samples
 
@@ -382,7 +467,13 @@ def main() -> None:
     experiment = checkpoint.get("model_config", {}).get("experiment", config.EXPERIMENT)
     def wants_chat_template(name: str | None, path: str) -> bool:
         text = f"{name or ''} {Path(path).name}".lower()
-        return "v2_6" in text or "v2_7" in text or "reply" in text
+        return (
+            "v2_6" in text
+            or "v2_7" in text
+            or "v2_8" in text
+            or "reply" in text
+            or "daily_dialog" in text
+        )
 
     use_template = (not args.raw_prompt) and wants_chat_template(experiment, args.checkpoint)
 
@@ -402,7 +493,13 @@ def main() -> None:
         # Primary is treated as the candidate when it is v2.6; otherwise compare improves over primary.
         def is_candidate(label: str) -> bool:
             lower = str(label).lower()
-            return "v2_7" in lower or "v2_6" in lower or "reply" in lower
+            return (
+                "v2_8" in lower
+                or "v2_7" in lower
+                or "v2_6" in lower
+                or "reply" in lower
+                or "daily" in lower
+            )
 
         if is_candidate(sides[0]["label"]) and not is_candidate(sides[-1]["label"]):
             candidate, baseline = sides[0], sides[-1]
@@ -420,6 +517,10 @@ def main() -> None:
                 num(candidate, "held_out_relevance_mean", 0)
                 > num(baseline, "held_out_relevance_mean", 0)
             ),
+            "held_out_faithful_improved": (
+                num(candidate, "held_out_faithful_rate", 0)
+                > num(baseline, "held_out_faithful_rate", 0)
+            ),
             "held_out_drift_improved": (
                 num(candidate, "held_out_story_drift_rate", 1)
                 <= num(baseline, "held_out_story_drift_rate", 1)
@@ -427,14 +528,16 @@ def main() -> None:
             "chat_relevance_improved": candidate["chat_relevance_mean"] > baseline["chat_relevance_mean"],
             "story_drift_improved": candidate["story_drift_rate"] < baseline["story_drift_rate"],
             "held_out_relevance_mean": candidate.get("held_out_relevance_mean"),
+            "held_out_faithful_rate": candidate.get("held_out_faithful_rate"),
             "chat_relevance_mean": candidate["chat_relevance_mean"],
             "story_drift_rate": candidate["story_drift_rate"],
             "pass_held_out_relevance": num(candidate, "held_out_relevance_mean", 0) >= 1.5,
+            "pass_held_out_faithful": num(candidate, "held_out_faithful_rate", 0) >= 0.8,
             "pass_held_out_drift": num(candidate, "held_out_story_drift_rate", 1) <= 0.25,
         }
         success["successful"] = bool(
-            success["held_out_relevance_improved"]
-            and success["pass_held_out_relevance"]
+            success["pass_held_out_relevance"]
+            and success["pass_held_out_faithful"]
             and success["pass_held_out_drift"]
         )
 

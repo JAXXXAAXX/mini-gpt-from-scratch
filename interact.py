@@ -15,9 +15,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import torch
 
 import config
-from generate import encode_prompt, generate_from_ids, load_model
+from generate import encode_prompt, load_model
 from src.dialogue_data import format_chat_prompt, trim_assistant_reply
-from src.tokenizer_utils import load_tokenizer
+from src.reply_grounding import generate_grounded
+from src.tokenizer_utils import eos_token_id, load_tokenizer
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -200,8 +201,24 @@ class Panel:
             raise ValueError("Type a sentence or a few words first.")
         use_chat = bool(getattr(config, "USE_CHAT_TEMPLATE", False))
         model_prompt = format_chat_prompt(prompt) if use_chat else prompt
-        temperature = 0.4 if use_chat else config.STORY_EVAL_TEMPERATURE
+        temperature = 0.35 if use_chat else config.STORY_EVAL_TEMPERATURE
         prompt_ids = encode_prompt(self.tokenizer, model_prompt, self.device)[0].tolist()
+        if use_chat:
+            continuation = generate_grounded(
+                self.model,
+                self.tokenizer,
+                prompt_ids,
+                user_text=prompt,
+                max_new_tokens=MAX_NEW_TOKENS,
+                temperature=temperature,
+                top_k=config.STORY_EVAL_TOP_K,
+                device=self.device,
+                eos_token_id=eos_token_id(self.tokenizer),
+                candidates=12,
+            )
+            return trim_assistant_reply(continuation)
+        from generate import generate_from_ids
+
         sample = generate_from_ids(
             self.model,
             self.tokenizer,

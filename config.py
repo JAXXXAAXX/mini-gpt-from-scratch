@@ -16,8 +16,10 @@ TOKENIZER_TYPE = "bpe"
 # "v2_3_rope_ctx256"      same budget as v2.2, fresh weights, RoPE on Q and K
 # "v2_4_stories20k"       same RoPE model, 20,000 stories, 12,000 steps
 # "v2_5_width256"         same data/budget as v2.4, embedding 256 and 8 heads
-# "v2_6_reply_ft"         fine-tune v2.5 on User/Assistant dialogue for topic replies
-# "v2_7_reply_generalize" restart dialogue fine-tune with compositional held-out-ready data
+# "v2_6_reply_ft"         legacy: was fine-tuned on synthetic chat templates (templates deleted)
+# "v2_7_reply_generalize" legacy: same; checkpoint kept for inference + grounded decoding
+# "v2_8_daily_dialog"     fine-tune on real DailyDialog only (no hand-written reply templates)
+# Active: v2.7 weights + prompt-grounded decoding (templates deleted from source).
 EXPERIMENT = "v2_7_reply_generalize"
 
 CHAR_TOKENIZER_PATH = "data/processed/tokenizer.json"
@@ -79,6 +81,17 @@ V2_7_NUM_HEADS = 8
 V2_7_NUM_LAYERS = 4
 V2_7_LEARNING_RATE = 8e-5
 V2_7_STORY_RATIO = 0.10
+V2_8_BLOCK_SIZE = 256
+V2_8_BATCH_SIZE = 8
+V2_8_MAX_STEPS = 17600
+V2_8_TRAIN_STORIES = 500
+V2_8_EMBEDDING_DIM = 256
+V2_8_NUM_HEADS = 8
+V2_8_NUM_LAYERS = 4
+V2_8_LEARNING_RATE = 5e-5
+V2_8_STORY_RATIO = 0.05
+V2_8_DAILY_TRAIN = 8000
+V2_8_DAILY_VALID = 500
 
 BLOCK_SIZE = V2_BPE_BLOCK_SIZE
 EMBEDDING_DIM = 128
@@ -88,10 +101,14 @@ NUM_LAYERS = 4
 
 DROPOUT = 0.1
 
-# "stories" = TinyStories only. "dialogue_mix" = chat docs plus a smaller story share.
+# "stories" = TinyStories only.
+# "daily_dialog" = real DailyDialog chats (no hand-written reply templates).
+# "dialogue_mix" was removed with the synthetic Assistant reply templates.
 DATA_MODE = "stories"
 USE_CHAT_TEMPLATE = False
 STORY_MIX_RATIO = 0.0
+DAILY_DIALOG_TRAIN = 8000
+DAILY_DIALOG_VALID = 500
 
 
 # Training configuration
@@ -203,13 +220,48 @@ V2_7_STORY_EVAL_REPORT = "experiments/story_eval_v2_7_reply_generalize.md"
 V2_7_REPLY_EVAL_JSON = "experiments/reply_eval_v2_6_v2_7.json"
 V2_7_REPLY_EVAL_REPORT = "experiments/reply_eval_v2_6_v2_7.md"
 
+V2_8_BEST_CHECKPOINT = "checkpoints/v2_8_daily_dialog_best.pt"
+V2_8_LATEST_CHECKPOINT = "checkpoints/v2_8_daily_dialog_latest.pt"
+V2_8_HISTORY_PATH = "experiments/training_history_v2_8_daily_dialog.json"
+V2_8_REPORT_PATH = "experiments/training_report_v2_8_daily_dialog.md"
+V2_8_LOSS_CURVE_PATH = "experiments/loss_curve_v2_8_daily_dialog.png"
+V2_8_STORY_EVAL_JSON = "experiments/story_eval_v2_8_daily_dialog.json"
+V2_8_STORY_EVAL_REPORT = "experiments/story_eval_v2_8_daily_dialog.md"
+V2_8_REPLY_EVAL_JSON = "experiments/reply_eval_v2_7_v2_8.json"
+V2_8_REPLY_EVAL_REPORT = "experiments/reply_eval_v2_7_v2_8.md"
+
 TOKENIZER_COMPARISON_REPORT = "experiments/tokenizer_comparison.md"
 TOKENIZER_COMPARISON_JSON = "experiments/tokenizer_comparison.json"
 
 # "absolute" keeps the learned position table. "rope" rotates Q and K only.
 POSITION_ENCODING = "absolute"
 
-if TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_7_reply_generalize":
+if TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_8_daily_dialog":
+    TOKENIZER_PATH = BPE_TOKENIZER_PATH
+    BLOCK_SIZE = V2_8_BLOCK_SIZE
+    BATCH_SIZE = V2_8_BATCH_SIZE
+    MAX_STEPS = V2_8_MAX_STEPS
+    NUM_TRAIN_STORIES = V2_8_TRAIN_STORIES
+    EMBEDDING_DIM = V2_8_EMBEDDING_DIM
+    NUM_HEADS = V2_8_NUM_HEADS
+    NUM_LAYERS = V2_8_NUM_LAYERS
+    LEARNING_RATE = V2_8_LEARNING_RATE
+    POSITION_ENCODING = "rope"
+    DATA_MODE = "daily_dialog"
+    USE_CHAT_TEMPLATE = True
+    STORY_MIX_RATIO = V2_8_STORY_RATIO
+    DAILY_DIALOG_TRAIN = V2_8_DAILY_TRAIN
+    DAILY_DIALOG_VALID = V2_8_DAILY_VALID
+    RESUME_CHECKPOINT = V2_7_BEST_CHECKPOINT
+    ALLOW_ROPE_RESUME = True
+    BEST_CHECKPOINT = V2_8_BEST_CHECKPOINT
+    LATEST_CHECKPOINT = V2_8_LATEST_CHECKPOINT
+    HISTORY_PATH = V2_8_HISTORY_PATH
+    REPORT_PATH = V2_8_REPORT_PATH
+    LOSS_CURVE_PATH = V2_8_LOSS_CURVE_PATH
+    STORY_EVAL_JSON = V2_8_STORY_EVAL_JSON
+    STORY_EVAL_REPORT = V2_8_STORY_EVAL_REPORT
+elif TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_7_reply_generalize":
     TOKENIZER_PATH = BPE_TOKENIZER_PATH
     BLOCK_SIZE = V2_7_BLOCK_SIZE
     BATCH_SIZE = V2_7_BATCH_SIZE
@@ -220,7 +272,8 @@ if TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_7_reply_generalize":
     NUM_LAYERS = V2_7_NUM_LAYERS
     LEARNING_RATE = V2_7_LEARNING_RATE
     POSITION_ENCODING = "rope"
-    DATA_MODE = "dialogue_mix"
+    # Inference / grounded decoding only. Retrain via v2_8_daily_dialog (templates removed).
+    DATA_MODE = "stories"
     USE_CHAT_TEMPLATE = True
     STORY_MIX_RATIO = V2_7_STORY_RATIO
     RESUME_CHECKPOINT = V2_5_BEST_CHECKPOINT
@@ -243,7 +296,7 @@ elif TOKENIZER_TYPE == "bpe" and EXPERIMENT == "v2_6_reply_ft":
     NUM_LAYERS = V2_6_NUM_LAYERS
     LEARNING_RATE = V2_6_LEARNING_RATE
     POSITION_ENCODING = "rope"
-    DATA_MODE = "dialogue_mix"
+    DATA_MODE = "stories"
     USE_CHAT_TEMPLATE = True
     STORY_MIX_RATIO = V2_6_STORY_RATIO
     RESUME_CHECKPOINT = V2_5_BEST_CHECKPOINT
@@ -358,7 +411,8 @@ else:
     raise ValueError(
         "Unsupported profile. Use EXPERIMENT 'v1', 'v2_bpe', 'v2_1_ctx256', "
         "'v2_2_ctx256_longtrain', 'v2_3_rope_ctx256', 'v2_4_stories20k', "
-        "'v2_5_width256', 'v2_6_reply_ft', or 'v2_7_reply_generalize'. "
+        "'v2_5_width256', 'v2_6_reply_ft', 'v2_7_reply_generalize', or "
+        "'v2_8_daily_dialog'. "
         f"Got TOKENIZER_TYPE={TOKENIZER_TYPE!r}, EXPERIMENT={EXPERIMENT!r}."
     )
 

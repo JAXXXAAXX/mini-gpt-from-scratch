@@ -18,7 +18,10 @@ import config
 from src.bpe_tokenizer import BPETokenizer
 from src.data_utils import load_tinystories, prepare_text
 from src.dataset import TextDataset
-from src.dialogue_data import build_synthetic_dialogues, dialogue_and_story_documents
+from src.dialogue_data import (
+    dialogue_and_story_documents,
+    load_daily_dialogues,
+)
 from src.model import MiniGPT
 from src.tokenizer import Tokenizer
 from src.tokenizer_utils import (
@@ -94,19 +97,21 @@ def main():
     print("Block size:", config.BLOCK_SIZE, "tokenizer units")
     print("Batch size:", config.BATCH_SIZE)
     print("Tokens per step:", config.BATCH_SIZE * config.BLOCK_SIZE)
-    if config.EXPERIMENT == "v2_7_reply_generalize":
+    if config.EXPERIMENT == "v2_8_daily_dialog":
         print(
-            "v2.7 restarts dialogue fine-tuning from v2.5 with compositional chat data. "
-            f"Learning rate {config.LEARNING_RATE}, story mix ratio "
-            f"{config.STORY_MIX_RATIO}, target step {config.MAX_STEPS}. "
-            "Success is judged on held-out reply prompts, not memorized templates."
+            "v2.8 fine-tunes from v2.7 on real DailyDialog only. "
+            "No hand-written reply templates are added. "
+            f"Learning rate {config.LEARNING_RATE}, target step {config.MAX_STEPS}."
+        )
+    elif config.EXPERIMENT == "v2_7_reply_generalize":
+        print(
+            "v2.7 checkpoint is inference-only here; hand-written reply templates "
+            "were deleted. For new chat fine-tuning use EXPERIMENT=v2_8_daily_dialog."
         )
     elif config.EXPERIMENT == "v2_6_reply_ft":
         print(
-            "v2.6 fine-tunes the v2.5 RoPE model on User/Assistant dialogue. "
-            f"Learning rate {config.LEARNING_RATE}, story mix ratio "
-            f"{config.STORY_MIX_RATIO}, target step {config.MAX_STEPS}. "
-            "Validation is scored on held-out chat documents."
+            "v2.6 checkpoint is legacy; hand-written reply templates were deleted. "
+            "For new chat fine-tuning use EXPERIMENT=v2_8_daily_dialog."
         )
     elif config.EXPERIMENT == "v2_5_width256":
         print(
@@ -151,8 +156,11 @@ def main():
 
     dialogue_train_docs: list[str] = []
     dialogue_valid_docs: list[str] = []
-    if config.DATA_MODE == "dialogue_mix":
-        dialogue_train_docs, dialogue_valid_docs = build_synthetic_dialogues()
+    if config.DATA_MODE == "daily_dialog":
+        dialogue_train_docs, dialogue_valid_docs = load_daily_dialogues(
+            num_train=config.DAILY_DIALOG_TRAIN,
+            num_valid=config.DAILY_DIALOG_VALID,
+        )
         train_docs = dialogue_and_story_documents(
             dialogue_train_docs,
             train_stories,
@@ -162,9 +170,14 @@ def main():
         valid_ids = encode_documents(tokenizer, dialogue_valid_docs)
         train_chars = sum(len(doc) for doc in train_docs)
         print(
-            f"Dialogue train docs: {len(dialogue_train_docs)}; "
+            f"DailyDialog train docs: {len(dialogue_train_docs)}; "
             f"mixed train docs: {len(train_docs)}; "
-            f"dialogue valid docs: {len(dialogue_valid_docs)}"
+            f"DailyDialog valid docs: {len(dialogue_valid_docs)}"
+        )
+    elif config.DATA_MODE == "dialogue_mix":
+        raise ValueError(
+            "DATA_MODE 'dialogue_mix' was removed with the hand-written reply templates. "
+            "Use DATA_MODE 'daily_dialog' for chat fine-tuning."
         )
     else:
         train_ids = encode_stories(tokenizer, train_stories, use_story_boundaries=use_boundaries)
@@ -205,7 +218,7 @@ def main():
                 f"Cannot resume because {resume_path} is missing. "
                 "Refusing to train a fresh run in its place."
             )
-        if config.EXPERIMENT in {"v2_6_reply_ft", "v2_7_reply_generalize"}:
+        if config.EXPERIMENT in {"v2_6_reply_ft", "v2_7_reply_generalize", "v2_8_daily_dialog"}:
             # Keep v2.5 weights, but use a fresh optimizer at the fine-tune learning rate.
             # Dialogue validation is a new domain, so do not carry the TinyStories best loss.
             checkpoint = torch.load(resume_path, map_location=device)
@@ -283,6 +296,7 @@ def main():
     if initial_history is not None and config.EXPERIMENT not in {
         "v2_6_reply_ft",
         "v2_7_reply_generalize",
+        "v2_8_daily_dialog",
     }:
         # Keep the resumed step eligible as the best v2.2 model if later evals are worse.
         resumed_point = initial_history[0]
