@@ -732,7 +732,9 @@ def minigpt_parameter_breakdown(model: nn.Module) -> dict:
 
     groups = {
         "token_embedding_parameters": count(model.token_embedding),
-        "position_embedding_parameters": count(model.position_embedding),
+        "position_embedding_parameters": (
+            0 if getattr(model, "position_embedding", None) is None else count(model.position_embedding)
+        ),
         "transformer_block_parameters": count(model.blocks),
         "final_layernorm_parameters": count(model.final_ln),
         "lm_head_parameters": count(model.lm_head),

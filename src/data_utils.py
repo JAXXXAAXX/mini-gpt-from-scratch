@@ -4,17 +4,21 @@ from datasets import load_dataset
 
 
 def _take_stories(split: str, limit: int) -> list[str]:
-    """Read only the first `limit` stories. The rest of the split is never loaded."""
-    dataset = load_dataset("roneneldan/TinyStories", split=split, streaming=True)
+    """Read only the first `limit` stories. The rest of the split is never loaded.
+
+    The slice is taken from the cached dataset. Streaming the parquet shards
+    failed on a corrupt Snappy block, while this cached slice still opens.
+    """
+    dataset = load_dataset("roneneldan/TinyStories", split=f"{split}[:{limit}]")
     stories = []
     for row in dataset:
         text = row.get("text")
         if not isinstance(text, str):
             raise ValueError(f"TinyStories {split} row has no text.")
         stories.append(text)
-        if len(stories) == limit:
-            return stories
-    raise ValueError(f"TinyStories {split} split only has {len(stories)} stories, needed {limit}.")
+    if len(stories) != limit:
+        raise ValueError(f"TinyStories {split} slice has {len(stories)} stories, needed {limit}.")
+    return stories
 
 
 def load_tinystories(num_train: int = 5000, num_valid: int = 500) -> tuple[list[str], list[str]]:
